@@ -5,10 +5,14 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-// 環境変数
+// ===== 環境変数確認 =====
 const OANDA_API_KEY = process.env.OANDA_API_KEY;
 const OANDA_ACCOUNT_ID = process.env.OANDA_ACCOUNT_ID;
 const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts"; // 本番
+
+console.log("🚀 Starting server...");
+console.log("OANDA_ACCOUNT_ID:", OANDA_ACCOUNT_ID ? "SET ✅" : "NOT SET ❌");
+console.log("OANDA_API_KEY:", OANDA_API_KEY ? "SET ✅" : "NOT SET ❌");
 
 // ===== GET / でサーバー稼働確認 =====
 app.get("/", (req, res) => {
@@ -27,6 +31,11 @@ app.post("/webhook", async (req, res) => {
 
     // ===== エントリー処理 =====
     if (alert === "LONG_ENTRY" || alert === "SHORT_ENTRY") {
+      if (!OANDA_API_KEY || !OANDA_ACCOUNT_ID) {
+        console.error("❌ Environment variables missing!");
+        return res.status(500).send("Server error ❌ - Missing env vars");
+      }
+
       const side = alert === "LONG_ENTRY" ? "buy" : "sell";
       const orderUnits = units || (side === "buy" ? 20000 : -20000);
 
@@ -60,7 +69,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("Order executed ✅");
     }
 
-    // ===== 決済処理（ZLSMAクロス） =====
+    // ===== 決済処理 =====
     if (alert === "LONG_EXIT_ZLSMA" || alert === "SHORT_EXIT_ZLSMA") {
       try {
         const posRes = await fetch(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/openPositions`, {
