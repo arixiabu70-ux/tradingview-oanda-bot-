@@ -1,56 +1,64 @@
 import express from "express";
-import fetchPkg from "node-fetch";
-const fetch = fetchPkg.default;
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-// ===== OANDA設定 =====
-const OANDA_API_URL = process.env.OANDA_API_URL || "https://api-fxtrade.oanda.com/v3";
-const ACCOUNT_ID = process.env.OANDA_ACCOUNT_ID;
-const API_KEY = process.env.OANDA_API_KEY;
+// ✅ Railway が指定するポートを使用
+const PORT = process.env.PORT || 8080;
 
-// ===== Webhook受信 =====
+// ✅ 動作確認用（ブラウザで「Cannot GET /」を防ぐ）
+app.get("/", (req, res) => {
+  res.send("OANDA Auto Trading Bot is running 🚀");
+});
+
+// ✅ Webhook受信エンドポイント
 app.post("/webhook", async (req, res) => {
-  const data = req.body;
-  console.log("✅ Webhook received:", data);
-
-  const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice, units } = data;
-  if (!alert || !symbol) return res.status(400).send("Invalid payload");
-
-  let side = alert === "LONG_ENTRY" ? "buy" :
-             alert === "SHORT_ENTRY" ? "sell" : "";
-
-  if (side === "") return res.status(400).send("No trade action");
-
   try {
-    console.log(`📈 Sending ${side.toUpperCase()} order for ${symbol} (${units || 1000} units)...`);
+    const data = req.body;
+    console.log("Received alert:", data);
 
-    const response = await fetch(`${OANDA_API_URL}/accounts/${ACCOUNT_ID}/orders`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
+    // 環境変数からOANDA認証情報を取得
+    const OANDA_API_KEY = process.env.OANDA_API_KEY;
+    const OANDA_ACCOUNT_ID = process.env.OANDA_ACCOUNT_ID;
+    const OANDA_API_URL = "https://api-fxpractice.oanda.com/v3/accounts";
+
+    // ロット指定（ユニット数）
+    const units = data.alert.includes("LONG") ? 20000 : -20000;
+
+    if (data.alert === "LONG_ENTRY" || data.alert === "SHORT_ENTRY") {
+      const order = {
         order: {
-          instrument: symbol,
-          units: side === "buy" ? (units || 1000) : -(units || 1000),
+          instrument: data.symbol,
+          units,
           type: "MARKET",
           positionFill: "DEFAULT"
         }
-      })
-    });
+      };
 
-    const result = await response.json();
-    console.log("📦 Order result:", result);
-    res.send("✅ Order executed");
+      const response = await fetch(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${OANDA_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(order)
+      });
+
+      const result = await response.json();
+      console.log("OANDA Response:", result);
+      res.status(200).send("Order sent to OANDA ✅");
+    } else {
+      res.status(200).send("No trade executed.");
+    }
+
   } catch (err) {
-    console.error("❌ Error:", err);
-    res.status(500).send("Error executing order");
+    console.error("Error:", err);
+    res.status(500).send("Server Error");
   }
 });
 
-// ===== Railway用ポート設定 =====
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// ✅ サーバー起動
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
