@@ -1,3 +1,6 @@
+console.log("OANDA_ACCOUNT_ID:", OANDA_ACCOUNT_ID);
+console.log("OANDA_API_KEY:", OANDA_API_KEY);
+
 import express from "express";
 
 const app = express();
