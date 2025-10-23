@@ -1,6 +1,4 @@
 import express from "express";
-import fetchPkg from "node-fetch";
-const fetch = fetchPkg.default;
 
 const app = express();
 app.use(express.json());
@@ -65,7 +63,6 @@ app.post("/webhook", async (req, res) => {
 
     // ===== 決済処理（ZLSMAクロス） =====
     if (alert === "LONG_EXIT_ZLSMA" || alert === "SHORT_EXIT_ZLSMA") {
-      const side = alert === "LONG_EXIT_ZLSMA" ? "buy" : "sell";
 
       // OANDAポジションを取得
       const posRes = await fetch(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/openPositions`, {
@@ -77,9 +74,9 @@ app.post("/webhook", async (req, res) => {
       if (!position) return res.status(200).send("No open position to close");
 
       // 決済用注文
-      const closeUnits = side === "buy"
-        ? -parseFloat(position.long.units)
-        : -parseFloat(position.short.units);
+      const closeUnits = alert === "LONG_EXIT_ZLSMA"
+        ? -parseFloat(position.long.units || 0)
+        : -parseFloat(position.short.units || 0);
 
       if (closeUnits === 0) return res.status(200).send("No units to close");
 
