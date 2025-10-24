@@ -7,7 +7,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-// ===== 環境変数 =====
 const { OANDA_ACCOUNT_ID, OANDA_API_KEY } = process.env;
 
 console.log("OANDA_ACCOUNT_ID:", OANDA_ACCOUNT_ID ? "SET ✅" : "NOT SET ❌");
@@ -18,15 +17,12 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
   process.exit(1);
 }
 
-// ===== 本番API =====
 const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
 
-// ===== GET / =====
 app.get("/", (req, res) => {
   res.send("OANDA Auto Trading Bot is running 🚀");
 });
 
-// ===== Webhook =====
 app.post("/webhook", async (req, res) => {
   try {
     const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice } = req.body;
@@ -40,11 +36,13 @@ app.post("/webhook", async (req, res) => {
 
       const entry = parseFloat(entryPrice.toFixed(2));
       const sl = parseFloat(stopLossPrice.toFixed(2));
+
+      // ⚡ ここでサーバー側で利確を計算（TradingViewでは計算式を書かない）
       const tp = takeProfitPrice
         ? parseFloat(takeProfitPrice.toFixed(2))
         : side === "buy"
-          ? parseFloat((entry + (entry - sl) * 2).toFixed(2))
-          : parseFloat((entry - (sl - entry) * 2).toFixed(2));
+          ? parseFloat((entry + (entry - sl) * 2).toFixed(2))  // ロングRR1:2
+          : parseFloat((entry - (sl - entry) * 2).toFixed(2)); // ショートRR1:2
 
       const orderUnits = side === "buy" ? FIXED_UNITS : -FIXED_UNITS;
 
@@ -123,5 +121,4 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ===== サーバー起動 =====
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
