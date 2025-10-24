@@ -1,59 +1,60 @@
 // server.js
 import express from "express";
-import fetch from "node-fetch"; // ← Node.jsでfetchを使うため必須
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-// ===== 環境変数の読み込み =====
+// ===== 環境変数 =====
 const { OANDA_ACCOUNT_ID, OANDA_API_KEY } = process.env;
 
-// 確認用ログ
 console.log("OANDA_ACCOUNT_ID:", OANDA_ACCOUNT_ID ? "SET ✅" : "NOT SET ❌");
 console.log("OANDA_API_KEY:", OANDA_API_KEY ? "SET ✅" : "NOT SET ❌");
 
-// 必須チェック
 if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
   console.error("❌ OANDA_ACCOUNT_ID または OANDA_API_KEY が設定されていません！");
   process.exit(1);
 }
 
-// 本番用 URL
+// ===== 本番API =====
 const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
 
-// ===== GET / で稼働確認 =====
+// ===== GET / =====
 app.get("/", (req, res) => {
   res.send("OANDA Auto Trading Bot is running 🚀");
 });
 
-// ===== Webhook受信 =====
+// ===== Webhook =====
 app.post("/webhook", async (req, res) => {
   try {
-    const data = req.body;
-    console.log("Received alert:", data);
-
-    const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice, units } = data;
+    const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice } = req.body;
     if (!alert || !symbol) return res.status(400).send("Invalid payload");
+
+    const FIXED_UNITS = 20000; // 固定ユニット
 
     // ===== エントリー処理 =====
     if (alert === "LONG_ENTRY" || alert === "SHORT_ENTRY") {
       const side = alert === "LONG_ENTRY" ? "buy" : "sell";
-      const orderUnits = units || (side === "buy" ? 20000 : -20000);
 
-      const SL = stopLossPrice;
-      const TP = takeProfitPrice || (side === "buy"
-        ? entryPrice + (entryPrice - SL) * 2
-        : entryPrice - (SL - entryPrice) * 2);
+      const entry = parseFloat(entryPrice.toFixed(2));
+      const sl = parseFloat(stopLossPrice.toFixed(2));
+      const tp = takeProfitPrice
+        ? parseFloat(takeProfitPrice.toFixed(2))
+        : side === "buy"
+          ? parseFloat((entry + (entry - sl) * 2).toFixed(2))
+          : parseFloat((entry - (sl - entry) * 2).toFixed(2));
+
+      const orderUnits = side === "buy" ? FIXED_UNITS : -FIXED_UNITS;
 
       const order = {
         order: {
           instrument: symbol,
           units: orderUnits,
           type: "MARKET",
-          stopLossOnFill: { price: SL.toFixed(3) },
-          takeProfitOnFill: { price: TP.toFixed(3) },
+          stopLossOnFill: { price: sl.toFixed(2) },
+          takeProfitOnFill: { price: tp.toFixed(2) },
           positionFill: "DEFAULT"
         }
       };
@@ -72,7 +73,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("Order executed ✅");
     }
 
-    // ===== 決済処理 =====
+    // ===== ZLSMAクロス決済 =====
     if (alert === "LONG_EXIT_ZLSMA" || alert === "SHORT_EXIT_ZLSMA") {
       const posRes = await fetch(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/openPositions`, {
         headers: { "Authorization": `Bearer ${OANDA_API_KEY}` }
