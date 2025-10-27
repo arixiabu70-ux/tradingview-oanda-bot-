@@ -13,6 +13,8 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
   process.exit(1);
 }
 
+// デモ環境なら以下を使用してください：
+// const OANDA_API_URL = "https://api-fxpractice.oanda.com/v3/accounts";
 const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
 
 // ===== 通貨ペアごとの小数桁を判定 =====
@@ -21,17 +23,28 @@ function getPrecision(symbol) {
   return 5; // EUR/USDなど
 }
 
+// ===== TradingView形式 → OANDA形式の変換 =====
+// 例: "OANDA:USDJPY" → "USD_JPY"
+function formatSymbol(rawSymbol) {
+  if (!rawSymbol) return "";
+  return rawSymbol.replace(/^.*:/, "").replace(/([A-Z]{3})([A-Z]{3})/, "$1_$2");
+}
+
 app.get("/", (req, res) => {
   res.send("OANDA Auto Trading Bot is running 🚀");
 });
 
 app.post("/webhook", async (req, res) => {
   try {
-    const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice } = req.body;
-    if (!alert || !symbol) return res.status(400).send("Invalid payload");
+    const { alert, symbol: rawSymbol, entryPrice, stopLossPrice, takeProfitPrice } = req.body;
+    if (!alert || !rawSymbol) return res.status(400).send("Invalid payload");
 
-    const FIXED_UNITS = 20000;
+    // 🔧 通貨ペア変換
+    const symbol = formatSymbol(rawSymbol);
     const precision = getPrecision(symbol);
+    const FIXED_UNITS = 20000;
+
+    console.log(`📩 Webhook受信: ${alert} (${symbol})`);
 
     // ===== エントリー処理 =====
     if (alert === "LONG_ENTRY" || alert === "SHORT_ENTRY") {
