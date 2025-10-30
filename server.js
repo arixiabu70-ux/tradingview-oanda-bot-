@@ -13,7 +13,7 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
 
 const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
 const FIXED_UNITS = 20000;
-const precision = 2; // USD/JPY 専用：小数点2桁
+const precision = 3; // ✅ USD/JPY 専用：小数点3桁 (例: 151.873)
 const ORDER_COOLDOWN_MS = 60 * 1000; // 1分間隔
 
 let lastOrderTime = { LONG: 0, SHORT: 0 };
@@ -81,9 +81,11 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("Order skipped (position exists) ⚠️");
     }
 
-    // === 注文作成 ===
+    // === 注文作成（JPYペア小数点3桁固定） ===
     const sl = stopLossPrice ? Number(parseFloat(stopLossPrice).toFixed(precision)) : null;
     const tp = takeProfitPrice ? Number(parseFloat(takeProfitPrice).toFixed(precision)) : null;
+
+    console.log(`🧮 Precision Adjusted Prices → SL: ${sl}, TP: ${tp}`);
 
     const order = {
       order: {
