@@ -3,6 +3,7 @@ import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
+
 const PORT = process.env.PORT || 8080;
 const { OANDA_ACCOUNT_ID, OANDA_API_KEY } = process.env;
 
@@ -13,16 +14,21 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
 
 const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
 const FIXED_UNITS = 20000;
-const precision = 3; // ✅ USD/JPY 専用：小数点3桁 (例: 151.873)
+const precision = 3; // USD/JPY 小数点3桁
 const ORDER_COOLDOWN_MS = 60 * 1000; // 1分間隔
 
 let lastOrderTime = { LONG: 0, SHORT: 0 };
 
 app.post("/webhook", async (req, res) => {
   try {
+    // 🔹 受信 JSON を丸ごとログ出力
+    console.log("📬 Received webhook payload:", JSON.stringify(req.body, null, 2));
+
     const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice } = req.body;
 
+    // alert がない、または symbol が USD_JPY でない場合は 400
     if (!alert || symbol !== "USD_JPY") {
+      console.warn("⚠️ Invalid or unsupported payload detected");
       return res.status(400).send("Invalid or unsupported payload");
     }
 
@@ -120,7 +126,7 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).send("Order executed ✅");
 
   } catch (err) {
-    console.error("❌ Error:", err);
+    console.error("❌ Error handling webhook:", err);
     res.status(500).send("Server error ❌");
   }
 });
