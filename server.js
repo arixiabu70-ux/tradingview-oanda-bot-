@@ -19,27 +19,32 @@ const ORDER_COOLDOWN_MS = 60 * 1000; // 1分間隔
 
 let lastOrderTime = { LONG: 0, SHORT: 0 };
 
+// === 価格をOANDA仕様に安全フォーマット ===
+function formatPrice(price, decimals = 3) {
+  if (price === null || price === undefined) return null;
+  return parseFloat(price).toFixed(decimals); // 文字列として返す
+}
+
 app.post("/webhook", async (req, res) => {
   try {
-    // 🔹 受信 JSON を丸ごとログ出力
     console.log("📬 Received webhook payload:", JSON.stringify(req.body, null, 2));
 
     const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice } = req.body;
 
-    // alert がない、または symbol が USD_JPY でない場合は 400
+    // alertが存在しない or 通貨ペアがUSD_JPYでない場合は拒否
     if (!alert || symbol !== "USD_JPY") {
       console.warn("⚠️ Invalid or unsupported payload detected");
       return res.status(400).send("Invalid or unsupported payload");
     }
 
-    // === 現在のポジション取得 ===
+    // === 現在のポジション確認 ===
     const posRes = await fetch(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/openPositions`, {
       headers: { "Authorization": `Bearer ${OANDA_API_KEY}` }
     });
     const posData = await posRes.json();
     const position = posData.positions?.find(p => p.instrument === symbol);
 
-    // === EXIT ===
+    // === EXIT 処理 ===
     if (alert.includes("EXIT")) {
       if (position) {
         const longUnits = parseFloat(position.long?.units || 0);
@@ -68,18 +73,18 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("Position closed ✅");
     }
 
-    // === ENTRY ===
+    // === ENTRY 処理 ===
     const side = alert.includes("LONG") ? "LONG" : "SHORT";
     const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
     const now = Date.now();
 
-    // 重複防止：1分間隔チェック
+    // 1分間のクールダウン
     if (now - lastOrderTime[side] < ORDER_COOLDOWN_MS) {
       console.log(`⚠️ ${side} order skipped (cooldown)`);
       return res.status(200).send("Order skipped (cooldown) ⚠️");
     }
 
-    // 既存ポジション確認
+    // 既存ポジションチェック
     const longExists = parseFloat(position?.long?.units || 0) > 0;
     const shortExists = parseFloat(position?.short?.units || 0) > 0;
     if ((side === "LONG" && longExists) || (side === "SHORT" && shortExists)) {
@@ -87,12 +92,13 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("Order skipped (position exists) ⚠️");
     }
 
-    // === 注文作成（JPYペア小数点3桁固定） ===
-    const sl = stopLossPrice ? Number(parseFloat(stopLossPrice).toFixed(precision)) : null;
-    const tp = takeProfitPrice ? Number(parseFloat(takeProfitPrice).toFixed(precision)) : null;
+    // === 価格をフォーマット ===
+    const sl = stopLossPrice ? formatPrice(stopLossPrice, precision) : null;
+    const tp = takeProfitPrice ? formatPrice(takeProfitPrice, precision) : null;
 
-    console.log(`🧮 Precision Adjusted Prices → SL: ${sl}, TP: ${tp}`);
+    console.log(`🧮 Precision Adjusted Prices → SL: ${sl} (${typeof sl}), TP: ${tp} (${typeof tp})`);
 
+    // === 注文データ作成 ===
     const order = {
       order: {
         instrument: "USD_JPY",
