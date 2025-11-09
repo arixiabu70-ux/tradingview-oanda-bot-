@@ -1,4 +1,4 @@
-// server.js (統合・改良版)
+// server.js (安定版・midPrice対応)
 // Node.js v18+ 推奨
 // 環境変数: OANDA_ACCOUNT_ID, OANDA_API_KEY を設定してください
 
@@ -17,12 +17,12 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
 }
 
 // ===== 設定 =====
-const OANDA_API_URL = "https://api-fxpractice.oanda.com/v3/accounts"; // デモ環境
-// const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts"; // 本番環境
+const OANDA_API_URL = "https://api-fxpractice.oanda.com/v3/accounts"; // デモ
 const FIXED_UNITS = 20000;
 const PRECISION = 3;
 const USDJPY_SPREAD = 0.008; // 0.8pips
-const ORDER_COOLDOWN_MS = 60 * 1000; // 1分クールダウン
+const ORDER_COOLDOWN_MS = 60 * 1000; // 1分
+const MIN_SLTP_PIPS = 0.01; // SL/TPの最小距離
 
 let lastOrderTime = { LONG: 0, SHORT: 0 };
 
@@ -55,10 +55,10 @@ async function closePositionAll(instrument) {
   const res = await fetch(url, {
     method: "PUT",
     headers: {
-      "Authorization": `Bearer ${OANDA_API_KEY}`,
-      "Content-Type": "application/json"
+      Authorization: `Bearer ${OANDA_API_KEY}`,
+      "Content-Type": "application/json",
     },
-    body
+    body,
   });
   return res.ok ? await res.json() : { error: true, status: res.status, text: await res.text() };
 }
@@ -69,9 +69,16 @@ async function placeMarketOrder(instrument, units, stopLossPrice = null, takePro
       instrument,
       units: String(units),
       type: "MARKET",
-      positionFill: "DEFAULT"
-    }
+      positionFill: "REDUCE_FIRST", // 逆方向自動クローズ
+    },
   };
+
+  // SL/TPを最小幅補正
+  if (stopLossPrice && takeProfitPrice) {
+    if (Math.abs(takeProfitPrice - stopLossPrice) < MIN_SLTP_PIPS) {
+      takeProfitPrice = stopLossPrice + MIN_SLTP_PIPS;
+    }
+  }
 
   if (stopLossPrice) {
     order.order.stopLossOnFill = { price: fmtPrice(stopLossPrice), timeInForce: "GTC" };
@@ -84,41 +91,22 @@ async function placeMarketOrder(instrument, units, stopLossPrice = null, takePro
   return await fetchJSON(url, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${OANDA_API_KEY}`,
-      "Content-Type": "application/json"
+      Authorization: `Bearer ${OANDA_API_KEY}`,
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify(order)
+    body: JSON.stringify(order),
   });
 }
 
-// === 平均足計算 ===
-function calcHeikinAshi(prevHaOpen, prevHaClose, open, high, low, close) {
-  const haClose = (open + high + low + close) / 4;
-  const haOpen = (prevHaOpen + prevHaClose) / 2 || (open + close) / 2;
-  const haHigh = Math.max(high, haOpen, haClose);
-  const haLow = Math.min(low, haOpen, haClose);
-  return { haOpen, haHigh, haLow, haClose };
-}
-
-// ===== Webhook エンドポイント =====
+// ===== Webhookエンドポイント =====
 app.post("/webhook", async (req, res) => {
   try {
     console.log("📬 Webhook受信:", JSON.stringify(req.body, null, 2));
-
     const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice, open, high, low, close } = req.body;
     if (!alert || !symbol) return res.status(400).json({ ok: false, message: "invalid payload" });
+    if (symbol !== "USD_JPY") return res.status(400).json({ ok: false, message: "unsupported symbol" });
 
-    if (symbol !== "USD_JPY") {
-      return res.status(400).json({ ok: false, message: "unsupported symbol" });
-    }
-
-    // === 平均足計算 ===
-    const ha = (open && high && low && close)
-      ? calcHeikinAshi(null, null, open, high, low, close)
-      : null;
-    if (ha) console.log("📉 平均足データ:", ha);
-
-    // === EXIT (全決済) ===
+    // EXIT or CLOSE_ALL
     if (alert.includes("EXIT") || alert === "CLOSE_ALL") {
       console.log("🔶 EXITシグナル受信: ポジション全決済");
       const pos = await getOpenPositionForInstrument(symbol);
@@ -127,7 +115,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ ok: true, action: "closed", result: closeResult });
     }
 
-    // === エントリー ===
+    // LONG or SHORT
     const side = alert.includes("LONG") ? "LONG" : alert.includes("SHORT") ? "SHORT" : null;
     if (!side) return res.status(400).json({ ok: false, message: "unknown alert side" });
 
@@ -152,19 +140,11 @@ app.post("/webhook", async (req, res) => {
     const tp = takeProfitPrice ? Number(takeProfitPrice) : null;
 
     console.log(`📤 MARKET注文: ${side}, units=${wantUnits}, SL=${sl}, TP=${tp}`);
-
     const placeResult = await placeMarketOrder(symbol, wantUnits, sl, tp);
     const fill = placeResult.orderFillTransaction || null;
-    const fullPrice = fill?.fullPrice || null;
-
-    const bid = parseFloat(fullPrice?.closeoutBid || 0);
-    const ask = parseFloat(fullPrice?.closeoutAsk || 0);
     const executedPrice = parseFloat(fill?.price || 0);
-    const midPrice = (bid && ask) ? (bid + ask) / 2 : executedPrice;
-    const spreadAdjusted =
-      side === "LONG" ? midPrice + USDJPY_SPREAD / 2 : midPrice - USDJPY_SPREAD / 2;
-
-    console.log("📊 約定詳細:", { side, executedPrice, midPrice, spreadAdjusted, bid, ask });
+    const midPrice = executedPrice; // 安定の midPrice
+    const spreadAdjusted = side === "LONG" ? midPrice + USDJPY_SPREAD / 2 : midPrice - USDJPY_SPREAD / 2;
 
     lastOrderTime[side] = now;
 
@@ -175,14 +155,10 @@ app.post("/webhook", async (req, res) => {
       executedPrice,
       midPrice,
       spreadAdjusted,
-      bid,
-      ask,
       requestedSL: sl ? fmtPrice(sl) : null,
       requestedTP: tp ? fmtPrice(tp) : null,
-      ha,
-      raw: placeResult
+      raw: placeResult,
     });
-
   } catch (err) {
     console.error("❌ /webhook error:", err);
     return res.status(500).json({ ok: false, error: String(err) });
