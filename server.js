@@ -17,7 +17,7 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
 }
 
 // ===== 設定 =====
-const OANDA_API_URL = "https://api-fxpractice.oanda.com/v3/accounts"; // デモ
+const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts"; // 
 const FIXED_UNITS = 20000;
 const PRECISION = 3;
 const USDJPY_SPREAD = 0.008; // 0.8pips
