@@ -52,16 +52,35 @@ async function getOpenPositionForInstrument(instrument) {
 async function closePositionAll(instrument) {
   const url = `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/positions/${instrument}/close`;
   const body = JSON.stringify({ longUnits: "ALL", shortUnits: "ALL" });
-  const res = await fetch(url, {
-    method: "PUT",
-    headers: {
-      Authorization: `Bearer ${OANDA_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body,
-  });
-  return res.ok ? await res.json() : { error: true, status: res.status, text: await res.text() };
+
+  console.log("📤 決済リクエスト送信:", url, body);
+
+  try {
+    const res = await fetch(url, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${OANDA_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body,
+    });
+
+    console.log("📨 OANDA決済レスポンスステータス:", res.status);
+    const text = await res.text();
+    console.log("📨 OANDA決済レスポンス内容:", text);
+
+    if (!res.ok) {
+      return { error: true, status: res.status, text };
+    }
+
+    const json = JSON.parse(text);
+    return json;
+  } catch (err) {
+    console.error("❌ 決済通信エラー:", err);
+    return { error: true, exception: String(err) };
+  }
 }
+
 
 async function placeMarketOrder(instrument, units, stopLossPrice = null, takeProfitPrice = null) {
   const order = {
