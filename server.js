@@ -1,4 +1,4 @@
-// server.js (安定版・midPrice対応)
+// server.js（OANDA決済安定版・midPrice対応）
 // Node.js v18+ 推奨
 // 環境変数: OANDA_ACCOUNT_ID, OANDA_API_KEY を設定してください
 
@@ -17,10 +17,10 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
 }
 
 // ===== 設定 =====
-const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts"; // 
+const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts"; // 本番環境
 const FIXED_UNITS = 20000;
 const PRECISION = 3;
-const USDJPY_SPREAD = 0.008; // 0.8pips
+const USDJPY_SPREAD = 0.008; // 約0.8pips
 const ORDER_COOLDOWN_MS = 60 * 1000; // 1分
 const MIN_SLTP_PIPS = 0.01; // SL/TPの最小距離
 
@@ -49,9 +49,22 @@ async function getOpenPositionForInstrument(instrument) {
   return (data.positions || []).find(p => p.instrument === instrument) || null;
 }
 
+// ✅ 決済安定版：実際に持っている方向のみクローズ
 async function closePositionAll(instrument) {
   const url = `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/positions/${instrument}/close`;
-  const body = JSON.stringify({ longUnits: "ALL", shortUnits: "ALL" });
+
+  const pos = await getOpenPositionForInstrument(instrument);
+  if (!pos) {
+    console.log("ℹ️ 決済対象ポジションなし");
+    return { ok: false, message: "no position" };
+  }
+
+  const longUnits = parseFloat(pos.long?.units || 0);
+  const shortUnits = parseFloat(pos.short?.units || 0);
+  const body = {};
+
+  if (longUnits > 0) body.longUnits = "ALL";
+  if (shortUnits < 0) body.shortUnits = "ALL";
 
   console.log("📤 決済リクエスト送信:", url, body);
 
@@ -62,7 +75,7 @@ async function closePositionAll(instrument) {
         Authorization: `Bearer ${OANDA_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body,
+      body: JSON.stringify(body),
     });
 
     console.log("📨 OANDA決済レスポンスステータス:", res.status);
@@ -81,18 +94,17 @@ async function closePositionAll(instrument) {
   }
 }
 
-
 async function placeMarketOrder(instrument, units, stopLossPrice = null, takeProfitPrice = null) {
   const order = {
     order: {
       instrument,
       units: String(units),
       type: "MARKET",
-      positionFill: "REDUCE_FIRST", // 逆方向自動クローズ
+      positionFill: "REDUCE_FIRST",
     },
   };
 
-  // SL/TPを最小幅補正
+  // SL/TP最小幅補正
   if (stopLossPrice && takeProfitPrice) {
     if (Math.abs(takeProfitPrice - stopLossPrice) < MIN_SLTP_PIPS) {
       takeProfitPrice = stopLossPrice + MIN_SLTP_PIPS;
@@ -121,11 +133,12 @@ async function placeMarketOrder(instrument, units, stopLossPrice = null, takePro
 app.post("/webhook", async (req, res) => {
   try {
     console.log("📬 Webhook受信:", JSON.stringify(req.body, null, 2));
-    const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice, open, high, low, close } = req.body;
+
+    const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice } = req.body;
     if (!alert || !symbol) return res.status(400).json({ ok: false, message: "invalid payload" });
     if (symbol !== "USD_JPY") return res.status(400).json({ ok: false, message: "unsupported symbol" });
 
-    // EXIT or CLOSE_ALL
+    // === EXIT or CLOSE_ALL ===
     if (alert.includes("EXIT") || alert === "CLOSE_ALL") {
       console.log("🔶 EXITシグナル受信: ポジション全決済");
       const pos = await getOpenPositionForInstrument(symbol);
@@ -134,7 +147,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ ok: true, action: "closed", result: closeResult });
     }
 
-    // LONG or SHORT
+    // === LONG or SHORT エントリー ===
     const side = alert.includes("LONG") ? "LONG" : alert.includes("SHORT") ? "SHORT" : null;
     if (!side) return res.status(400).json({ ok: false, message: "unknown alert side" });
 
@@ -160,9 +173,10 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`📤 MARKET注文: ${side}, units=${wantUnits}, SL=${sl}, TP=${tp}`);
     const placeResult = await placeMarketOrder(symbol, wantUnits, sl, tp);
+
     const fill = placeResult.orderFillTransaction || null;
     const executedPrice = parseFloat(fill?.price || 0);
-    const midPrice = executedPrice; // 安定の midPrice
+    const midPrice = executedPrice;
     const spreadAdjusted = side === "LONG" ? midPrice + USDJPY_SPREAD / 2 : midPrice - USDJPY_SPREAD / 2;
 
     lastOrderTime[side] = now;
