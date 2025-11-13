@@ -1,4 +1,4 @@
-// server.js（OANDA決済安定版・midPrice対応）
+// server.js（OANDA決済安定版・midPrice対応・ユニット20000・RR1:2）
 // Node.js v18+ 推奨
 // 環境変数: OANDA_ACCOUNT_ID, OANDA_API_KEY を設定してください
 
@@ -16,13 +16,11 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
   process.exit(1);
 }
 
-// ===== 設定 =====
-const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts"; // 本番環境
+const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
 const FIXED_UNITS = 20000;
 const PRECISION = 3;
-const USDJPY_SPREAD = 0.008; // 約0.8pips
-const ORDER_COOLDOWN_MS = 60 * 1000; // 1分
 const MIN_SLTP_PIPS = 0.01; // SL/TPの最小距離
+const ORDER_COOLDOWN_MS = 60 * 1000; // 1分
 
 let lastOrderTime = { LONG: 0, SHORT: 0 };
 
@@ -52,7 +50,6 @@ async function getOpenPositionForInstrument(instrument) {
 // ✅ 決済安定版：実際に持っている方向のみクローズ
 async function closePositionAll(instrument) {
   const url = `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/positions/${instrument}/close`;
-
   const pos = await getOpenPositionForInstrument(instrument);
   if (!pos) {
     console.log("ℹ️ 決済対象ポジションなし");
@@ -62,7 +59,6 @@ async function closePositionAll(instrument) {
   const longUnits = parseFloat(pos.long?.units || 0);
   const shortUnits = parseFloat(pos.short?.units || 0);
   const body = {};
-
   if (longUnits > 0) body.longUnits = "ALL";
   if (shortUnits < 0) body.shortUnits = "ALL";
 
@@ -71,23 +67,15 @@ async function closePositionAll(instrument) {
   try {
     const res = await fetch(url, {
       method: "PUT",
-      headers: {
-        Authorization: `Bearer ${OANDA_API_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${OANDA_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
 
-    console.log("📨 OANDA決済レスポンスステータス:", res.status);
     const text = await res.text();
-    console.log("📨 OANDA決済レスポンス内容:", text);
+    console.log("📨 OANDA決済レスポンス:", text);
 
-    if (!res.ok) {
-      return { error: true, status: res.status, text };
-    }
-
-    const json = JSON.parse(text);
-    return json;
+    if (!res.ok) return { error: true, status: res.status, text };
+    return JSON.parse(text);
   } catch (err) {
     console.error("❌ 決済通信エラー:", err);
     return { error: true, exception: String(err) };
@@ -111,20 +99,13 @@ async function placeMarketOrder(instrument, units, stopLossPrice = null, takePro
     }
   }
 
-  if (stopLossPrice) {
-    order.order.stopLossOnFill = { price: fmtPrice(stopLossPrice), timeInForce: "GTC" };
-  }
-  if (takeProfitPrice) {
-    order.order.takeProfitOnFill = { price: fmtPrice(takeProfitPrice), timeInForce: "GTC" };
-  }
+  if (stopLossPrice) order.order.stopLossOnFill = { price: fmtPrice(stopLossPrice), timeInForce: "GTC" };
+  if (takeProfitPrice) order.order.takeProfitOnFill = { price: fmtPrice(takeProfitPrice), timeInForce: "GTC" };
 
   const url = `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders`;
   return await fetchJSON(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OANDA_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${OANDA_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify(order),
   });
 }
@@ -141,8 +122,6 @@ app.post("/webhook", async (req, res) => {
     // === EXIT or CLOSE_ALL ===
     if (alert.includes("EXIT") || alert === "CLOSE_ALL") {
       console.log("🔶 EXITシグナル受信: ポジション全決済");
-      const pos = await getOpenPositionForInstrument(symbol);
-      if (!pos) return res.status(200).json({ ok: true, message: "no position to close" });
       const closeResult = await closePositionAll(symbol);
       return res.status(200).json({ ok: true, action: "closed", result: closeResult });
     }
@@ -161,8 +140,8 @@ app.post("/webhook", async (req, res) => {
     const longUnits = pos ? parseFloat(pos.long?.units || 0) : 0;
     const shortUnits = pos ? parseFloat(pos.short?.units || 0) : 0;
     const netUnits = longUnits - shortUnits;
-
     const wantUnits = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
+
     if ((side === "LONG" && netUnits > 0) || (side === "SHORT" && netUnits < 0)) {
       console.log(`⚠️ ${side} position already exists.`);
       return res.status(200).json({ ok: true, message: "position exists" });
@@ -176,8 +155,6 @@ app.post("/webhook", async (req, res) => {
 
     const fill = placeResult.orderFillTransaction || null;
     const executedPrice = parseFloat(fill?.price || 0);
-    const midPrice = executedPrice;
-    const spreadAdjusted = side === "LONG" ? midPrice + USDJPY_SPREAD / 2 : midPrice - USDJPY_SPREAD / 2;
 
     lastOrderTime[side] = now;
 
@@ -186,12 +163,11 @@ app.post("/webhook", async (req, res) => {
       action: "order_placed",
       side,
       executedPrice,
-      midPrice,
-      spreadAdjusted,
       requestedSL: sl ? fmtPrice(sl) : null,
       requestedTP: tp ? fmtPrice(tp) : null,
       raw: placeResult,
     });
+
   } catch (err) {
     console.error("❌ /webhook error:", err);
     return res.status(500).json({ ok: false, error: String(err) });
