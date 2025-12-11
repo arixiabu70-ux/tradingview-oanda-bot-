@@ -16,9 +16,9 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
 
 const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
 const FIXED_UNITS = 20000;
-const MIN_SLTP_PIPS = 0.01; // SL/TPの最小距離（通貨単位） - 必要に応じて通貨毎マップ化可能
+const MIN_SLTP_PIPS = 0.05; // SL/TPの最小距離（通貨単位） - 必要に応じて通貨毎マップ化可能
 const ORDER_COOLDOWN_MS = 60 * 1000; // 1分（シンボル単位に変更）
-const EPS = 0.002; // 重複STOP/LIMIT 判定の誤差（JPY向けに広めに設定）
+const EPS = 0.005; // 重複STOP/LIMIT 判定の誤差（JPY向けに広めに設定）
 
 // シンボル単位クールダウン管理（キーは symbol のみ）
 let lastOrderTime = {}; // { 'USD_JPY': timestamp }
