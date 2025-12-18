@@ -1,4 +1,4 @@
-// server.js（OANDA 対応版・TradingView alert() 完全対応）
+// server.js（OANDA 対応版・TradingView alert() 完全対応・SAFE版）
 // Node.js v18+
 import express from "express";
 import fetch from "node-fetch";
@@ -15,19 +15,28 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
 }
 
 const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
+
+// ===== 設定 =====
 const FIXED_UNITS = 20000;
 const MIN_SLTP_PIPS = 0.05;
 const ORDER_COOLDOWN_MS = 60 * 1000;
+const EXIT_GRACE_MS = 500;        // ← ★ EXIT直後ガード
 const EPS = 0.005;
 
+const PRECISION_MAP = {
+  USD_JPY: 3,
+  EUR_USD: 5
+};
+
+// ===== 状態管理 =====
 let lastOrderTime = {};
+let lastExitTime  = {};
 
-const PRECISION_MAP = { USD_JPY: 3, EUR_USD: 5 };
-
-// ===== ヘルパー =====
+// =======================================================
+// ヘルパー
+// =======================================================
 function fmtPrice(price, symbol = "USD_JPY") {
-  if (price === null || price === undefined) return null;
-  const decimals = PRECISION_MAP[symbol] || 3;
+  const decimals = PRECISION_MAP[symbol] ?? 3;
   const n = Number(price);
   if (!isFinite(n)) return null;
   return Number(n.toFixed(decimals)).toFixed(decimals);
@@ -38,6 +47,7 @@ async function fetchJSON(url, options = {}) {
   const text = await res.text();
   console.log(`📥 HTTP ${res.status} ${url}`);
   console.log("📥 Body:", text);
+  if (!res.ok) throw new Error(text);
   return JSON.parse(text);
 }
 
@@ -65,7 +75,7 @@ function isTooClose(a, b, min) {
   return Math.abs(Number(a) - Number(b)) < min;
 }
 
-async function getOpenPositionForInstrument(symbol) {
+async function getOpenPosition(symbol) {
   const url = `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/openPositions`;
   const data = await fetchWithRetry(url, {
     headers: { Authorization: `Bearer ${OANDA_API_KEY}` }
@@ -84,68 +94,46 @@ async function getPendingOrders(symbol) {
 async function cancelAllPendingOrders(symbol) {
   const orders = await getPendingOrders(symbol);
   for (const o of orders) {
-    await fetch(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`, {
-      method: "PUT",
-      headers: { Authorization: `Bearer ${OANDA_API_KEY}` }
-    });
+    await fetch(
+      `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
+      {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${OANDA_API_KEY}` }
+      }
+    );
   }
-}
-
-async function placePendingOrder(symbol, units, entry, sl, tp, type) {
-  const body = {
-    order: {
-      type,
-      instrument: symbol,
-      units: String(units),
-      price: fmtPrice(entry, symbol),
-      timeInForce: "GTC",
-      positionFill: "DEFAULT",
-      stopLossOnFill: sl ? { price: fmtPrice(sl, symbol) } : undefined,
-      takeProfitOnFill: tp ? { price: fmtPrice(tp, symbol) } : undefined,
-    }
-  };
-
-  const res = await fetch(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OANDA_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
-
-  const text = await res.text();
-  if (!res.ok) throw new Error(text);
-  return JSON.parse(text);
 }
 
 async function closePositionAll(symbol) {
   await cancelAllPendingOrders(symbol);
-  const pos = await getOpenPositionForInstrument(symbol);
+
+  const pos = await getOpenPosition(symbol);
   if (!pos) return;
 
   const body = {};
   if (Number(pos.long.units) > 0) body.longUnits = "ALL";
   if (Number(pos.short.units) < 0) body.shortUnits = "ALL";
 
-  await fetch(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/positions/${symbol}/close`, {
-    method: "PUT",
-    headers: {
-      Authorization: `Bearer ${OANDA_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
+  await fetch(
+    `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/positions/${symbol}/close`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${OANDA_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    }
+  );
 }
 
 // =======================================================
-// 🔥 TradingView Webhook（alert() 完全対応）
+// 🔥 TradingView Webhook
 // =======================================================
 app.post("/webhook", async (req, res) => {
   try {
     console.log("📬 RAW:", req.body);
 
-    // --- 🔴 ここが最重要 ---
     let payload = req.body;
     if (typeof req.body.alert_message === "string") {
       payload = JSON.parse(req.body.alert_message);
@@ -158,19 +146,37 @@ app.post("/webhook", async (req, res) => {
       return res.status(400).json({ error: "invalid payload" });
     }
 
+    const now = Date.now();
+
+    // =====================
     // EXIT
-    if (alert.includes("EXIT")) {
+    // =====================
+    if (alert === "EXIT") {
+      console.log("🚪 EXIT received");
+      lastExitTime[symbol] = now;
+      lastOrderTime[symbol] = 0; // クールダウン解除
       await closePositionAll(symbol);
       return res.json({ ok: true, action: "exit" });
     }
 
-    const side = alert.includes("LONG") ? "LONG" : "SHORT";
-    const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
+    // =====================
+    // ENTRY（EXIT直後ガード）
+    // =====================
+    if (now - (lastExitTime[symbol] || 0) < EXIT_GRACE_MS) {
+      console.log("⏭ ENTRY skipped (just exited)");
+      return res.json({ ok: true, skipped: "just exited" });
+    }
 
-    const now = Date.now();
+    if (!["LONG_LIMIT", "SHORT_LIMIT"].includes(alert)) {
+      return res.status(400).json({ error: "unknown alert type" });
+    }
+
     if (now - (lastOrderTime[symbol] || 0) < ORDER_COOLDOWN_MS) {
       return res.json({ ok: true, skipped: "cooldown" });
     }
+
+    const side  = alert === "LONG_LIMIT" ? "LONG" : "SHORT";
+    const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
 
     const entry = Number(entryPrice);
     const sl = stopLossPrice != null ? Number(stopLossPrice) : null;
@@ -182,19 +188,22 @@ app.post("/webhook", async (req, res) => {
     }
 
     const pending = await getPendingOrders(symbol);
-    if (pending.find(o => Math.abs(Number(o.price) - entry) < EPS)) {
+    if (pending.some(o => Math.abs(Number(o.price) - entry) < EPS)) {
       return res.json({ ok: true, skipped: "duplicate" });
     }
 
     await placePendingOrder(symbol, units, entry, sl, tp, "LIMIT");
     lastOrderTime[symbol] = now;
 
+    console.log("✅ LIMIT order placed");
     return res.json({ ok: true });
 
   } catch (err) {
-    console.error("❌ webhook error:", err);
+    console.error("❌ webhook error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on ${PORT}`);
+});
