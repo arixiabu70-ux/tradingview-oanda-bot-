@@ -20,7 +20,7 @@ const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
 const FIXED_UNITS = 20000;
 const MIN_SLTP_PIPS = 0.05;
 const ORDER_COOLDOWN_MS = 60 * 1000;
-const EXIT_GRACE_MS = 500;        // ← ★ EXIT直後ガード
+const EXIT_GRACE_MS = 500;
 const EPS = 0.005;
 
 const PRECISION_MAP = {
@@ -39,7 +39,7 @@ function fmtPrice(price, symbol = "USD_JPY") {
   const decimals = PRECISION_MAP[symbol] ?? 3;
   const n = Number(price);
   if (!isFinite(n)) return null;
-  return Number(n.toFixed(decimals)).toFixed(decimals);
+  return n.toFixed(decimals);
 }
 
 async function fetchJSON(url, options = {}) {
@@ -128,6 +128,43 @@ async function closePositionAll(symbol) {
 }
 
 // =======================================================
+// ★ 追加：LIMIT 注文発行（500の根本原因を修正）
+// =======================================================
+async function placePendingOrder(symbol, units, entry, sl, tp, type = "LIMIT") {
+  const body = {
+    order: {
+      type,
+      instrument: symbol,
+      units: units.toString(),
+      price: fmtPrice(entry, symbol),
+      timeInForce: "GTC",
+      positionFill: "DEFAULT"
+    }
+  };
+
+  if (sl != null) {
+    body.order.stopLossOnFill = { price: fmtPrice(sl, symbol) };
+  }
+  if (tp != null) {
+    body.order.takeProfitOnFill = { price: fmtPrice(tp, symbol) };
+  }
+
+  console.log("📤 PLACE ORDER:", JSON.stringify(body));
+
+  return await fetchWithRetry(
+    `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OANDA_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    }
+  );
+}
+
+// =======================================================
 // 🔥 TradingView Webhook
 // =======================================================
 app.post("/webhook", async (req, res) => {
@@ -148,22 +185,17 @@ app.post("/webhook", async (req, res) => {
 
     const now = Date.now();
 
-    // =====================
-    // EXIT
-    // =====================
+    // ===== EXIT =====
     if (alert === "EXIT") {
       console.log("🚪 EXIT received");
       lastExitTime[symbol] = now;
-      lastOrderTime[symbol] = 0; // クールダウン解除
+      lastOrderTime[symbol] = 0;
       await closePositionAll(symbol);
       return res.json({ ok: true, action: "exit" });
     }
 
-    // =====================
-    // ENTRY（EXIT直後ガード）
-    // =====================
+    // ===== ENTRY ガード =====
     if (now - (lastExitTime[symbol] || 0) < EXIT_GRACE_MS) {
-      console.log("⏭ ENTRY skipped (just exited)");
       return res.json({ ok: true, skipped: "just exited" });
     }
 
@@ -175,8 +207,7 @@ app.post("/webhook", async (req, res) => {
       return res.json({ ok: true, skipped: "cooldown" });
     }
 
-    const side  = alert === "LONG_LIMIT" ? "LONG" : "SHORT";
-    const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
+    const units = alert === "LONG_LIMIT" ? FIXED_UNITS : -FIXED_UNITS;
 
     const entry = Number(entryPrice);
     const sl = stopLossPrice != null ? Number(stopLossPrice) : null;
@@ -199,7 +230,7 @@ app.post("/webhook", async (req, res) => {
     return res.json({ ok: true });
 
   } catch (err) {
-    console.error("❌ webhook error:", err.message);
+    console.error("❌ webhook error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
