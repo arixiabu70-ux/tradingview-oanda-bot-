@@ -20,7 +20,7 @@ const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
 // 設定（SAFE）
 // ======================
 const FIXED_UNITS = 20000;
-const MIN_SLTP_PIPS = 0.15;     // 15分足向け（約1.5pips）
+const MIN_SLTP_PIPS = 0.015;     // 15分足向け（約1.5pips）
 const ORDER_COOLDOWN_MS = 60_000;
 const EXIT_GRACE_MS = 800;
 const EPS = 0.005;
