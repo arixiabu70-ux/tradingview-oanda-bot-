@@ -1,5 +1,4 @@
-// server.js（OANDA SAFE 完成版・最終）
-// Node.js v18+
+// server.js（指値限定・ガード緩和・ログ強化版）
 import express from "express";
 import fetch from "node-fetch";
 
@@ -15,15 +14,9 @@ if (!OANDA_ACCOUNT_ID || !OANDA_API_KEY) {
 }
 
 const OANDA_API_URL = "https://api-fxtrade.oanda.com/v3/accounts";
-
-// ======================
-// 設定（SAFE）
-// ======================
 const FIXED_UNITS = 20000;
-const MIN_SLTP_PIPS = 0.015;     // 15分足向け（約1.5pips）
-const ORDER_COOLDOWN_MS = 60_000;
-const EXIT_GRACE_MS = 800;
-const EPS = 0.005;
+const ORDER_COOLDOWN_MS = 30_000; // 連続注文防止（30秒 ）
+const EXIT_GRACE_MS = 500;       // 決済後の待機時間
 
 const PRECISION_MAP = {
   USD_JPY: 3,
@@ -33,61 +26,44 @@ const PRECISION_MAP = {
 let lastOrderTime = {};
 let lastExitTime  = {};
 
-// ======================
-// ヘルパー
-// ======================
-const fmtPrice = (p, s="USD_JPY") =>
-  Number(p).toFixed(PRECISION_MAP[s] ?? 3);
+const fmtPrice = (p, s="USD_JPY") => Number(p).toFixed(PRECISION_MAP[s] ?? 3);
+const auth = { 
+  Authorization: `Bearer ${OANDA_API_KEY}`,
+  "Content-Type": "application/json"
+};
 
+// ログ出力を強化した共通フェッチ関数
 async function fetchJSON(url, options={}) {
   const res = await fetch(url, options);
   const text = await res.text();
-  console.log(`📥 ${res.status} ${url}`);
-  console.log(text);
-  if (!res.ok) throw new Error(text);
+  
+  // すべての通信結果をログに記録
+  console.log(`📡 API CALL: ${options.method || 'GET'} ${url}`);
+  console.log(`📥 RESPONSE [${res.status}]:`, text);
+  
+  if (!res.ok) {
+    console.error(`❌ OANDA API ERROR: ${res.status} - ${text}`);
+    throw new Error(text);
+  }
   return JSON.parse(text);
 }
 
-const auth = { Authorization: `Bearer ${OANDA_API_KEY}` };
-
-async function getCurrentMidPrice(symbol) {
-  const d = await fetchJSON(
-    `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/pricing?instruments=${symbol}`,
-    { headers: auth }
-  );
-  const p = d.prices[0];
-  return (Number(p.closeoutBid) + Number(p.closeoutAsk)) / 2;
-}
-
 async function getOpenPosition(symbol) {
-  const d = await fetchJSON(
-    `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/openPositions`,
-    { headers: auth }
-  );
+  const d = await fetchJSON(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/openPositions`, { headers: auth });
   return d.positions?.find(p => p.instrument === symbol) ?? null;
 }
 
-async function getPendingOrders(symbol) {
-  const d = await fetchJSON(
-    `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders`,
-    { headers: auth }
-  );
-  return (d.orders ?? []).filter(
-    o => o.instrument === symbol && o.type === "LIMIT"
-  );
-}
-
 async function cancelAllPendingOrders(symbol) {
-  const orders = await getPendingOrders(symbol);
+  const d = await fetchJSON(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders?instrument=${symbol}&state=PENDING`, { headers: auth });
+  const orders = d.orders ?? [];
   for (const o of orders) {
-    await fetchJSON(
-      `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
-      { method: "PUT", headers: auth }
-    );
+    console.log(`🗑️ Cancelling pending order: ${o.id}`);
+    await fetchJSON(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`, { method: "PUT", headers: auth });
   }
 }
 
 async function closePositionAll(symbol) {
+  // 新しい注文の前に既存の指値をすべて消す
   await cancelAllPendingOrders(symbol);
 
   const pos = await getOpenPosition(symbol);
@@ -97,14 +73,14 @@ async function closePositionAll(symbol) {
   if (Number(pos.long.units) > 0) body.longUnits = "ALL";
   if (Number(pos.short.units) < 0) body.shortUnits = "ALL";
 
-  await fetchJSON(
-    `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/positions/${symbol}/close`,
-    {
+  if (Object.keys(body).length > 0) {
+    console.log(`Closing position for ${symbol}...`);
+    await fetchJSON(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/positions/${symbol}/close`, {
       method: "PUT",
-      headers: { ...auth, "Content-Type": "application/json" },
+      headers: auth,
       body: JSON.stringify(body)
-    }
-  );
+    });
+  }
 }
 
 async function placeLimit(symbol, units, entry, sl, tp) {
@@ -115,84 +91,58 @@ async function placeLimit(symbol, units, entry, sl, tp) {
       units: units.toString(),
       price: fmtPrice(entry, symbol),
       timeInForce: "GTC",
-      positionFill: "DEFAULT", // ★ 修正：新規エントリー対応
+      positionFill: "DEFAULT",
       stopLossOnFill: sl ? { price: fmtPrice(sl, symbol) } : undefined,
       takeProfitOnFill: tp ? { price: fmtPrice(tp, symbol) } : undefined
     }
   };
 
-  console.log("📤 PLACE ORDER:", body);
+  console.log("📤 SENDING LIMIT ORDER:", JSON.stringify(body));
 
-  return fetchJSON(
-    `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders`,
-    {
-      method: "POST",
-      headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }
-  );
+  return fetchJSON(`${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders`, {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify(body)
+  });
 }
 
 // ======================
-// Webhook
+// Webhook Endpoint
 // ======================
 app.post("/webhook", async (req, res) => {
   try {
-    const payload = req.body.alert_message
-      ? JSON.parse(req.body.alert_message)
-      : req.body;
+    const payload = req.body.alert_message ? JSON.parse(req.body.alert_message) : req.body;
+    console.log("📬 WEBHOOK RECEIVED:", payload);
 
-    console.log("📬 WEBHOOK:", payload);
-
-    const {
-      alert,
-      symbol,
-      entryPrice,
-      stopLossPrice,
-      takeProfitPrice
-    } = payload;
-
+    const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice } = payload;
     const now = Date.now();
 
-    // ===== EXIT =====
+    // EXITアラートの処理
     if (alert === "EXIT") {
       lastExitTime[symbol] = now;
-      lastOrderTime[symbol] = 0;
       await closePositionAll(symbol);
       return res.json({ ok: true, action: "exit" });
     }
 
-    // ===== ガード =====
-    if (now - (lastExitTime[symbol] ?? 0) < EXIT_GRACE_MS)
-      return res.json({ skipped: "exit grace" });
+    // ガード処理（時間制限のみ維持）
+    if (now - (lastExitTime[symbol] ?? 0) < EXIT_GRACE_MS) {
+      return res.json({ skipped: "exit grace period" });
+    }
+    if (now - (lastOrderTime[symbol] ?? 0) < ORDER_COOLDOWN_MS) {
+      return res.json({ skipped: "cooldown period" });
+    }
 
-    if (now - (lastOrderTime[symbol] ?? 0) < ORDER_COOLDOWN_MS)
-      return res.json({ skipped: "cooldown" });
+    const units = alert === "LONG_LIMIT" ? FIXED_UNITS : alert === "SHORT_LIMIT" ? -FIXED_UNITS : 0;
+    if (!units) return res.json({ skipped: "unknown alert type" });
 
-    const pos = await getOpenPosition(symbol);
-    if (pos) return res.json({ skipped: "position exists" });
+    // 注文前に既存の状態をクリーンアップ（指値キャンセル & ポジション決済）
+    await closePositionAll(symbol);
 
-    const pending = await getPendingOrders(symbol);
-    if (pending.length) return res.json({ skipped: "pending exists" });
-
-    const entry = Number(entryPrice);
-    const market = await getCurrentMidPrice(symbol);
-
-    if (Math.abs(entry - market) < MIN_SLTP_PIPS)
-      return res.json({ skipped: "too close to market" });
-
-    const units =
-      alert === "LONG_LIMIT" ? FIXED_UNITS :
-      alert === "SHORT_LIMIT" ? -FIXED_UNITS :
-      0;
-
-    if (!units)
-      return res.json({ skipped: "unknown alert type" });
-
+    // 指値注文の実行
     await placeLimit(
       symbol,
       units,
-      entry,
+      Number(entryPrice),
       Number(stopLossPrice),
       Number(takeProfitPrice)
     );
@@ -201,7 +151,7 @@ app.post("/webhook", async (req, res) => {
     return res.json({ ok: true });
 
   } catch (e) {
-    console.error("❌ ERROR:", e);
+    console.error("❌ WEBHOOK ERROR:", e.message);
     return res.status(500).json({ error: e.message });
   }
 });
