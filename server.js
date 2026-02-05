@@ -19,12 +19,23 @@ const auth = {
 
 const fmt = (p, s) => Number(p).toFixed(PRECISION[s] ?? 3);
 
-async function fetchJSON(url, options={}) {
+async function fetchJSON(url, options = {}) {
   const res = await fetch(url, options);
   const text = await res.text();
   console.log(`📡 ${options.method} ${url}`);
   console.log(`📥 [${res.status}] ${text}`);
   try { return JSON.parse(text); } catch { return {}; }
+}
+
+// ==============================
+// ポジション有無チェック（追加）
+// ==============================
+async function hasPosition(symbol) {
+  const r = await fetchJSON(
+    `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/openPositions`,
+    { method: "GET", headers: auth }
+  );
+  return (r.positions ?? []).some(p => p.instrument === symbol);
 }
 
 async function closeAll(symbol) {
@@ -33,7 +44,7 @@ async function closeAll(symbol) {
     {
       method: "PUT",
       headers: auth,
-      body: JSON.stringify({ longUnits:"ALL", shortUnits:"ALL" })
+      body: JSON.stringify({ longUnits: "ALL", shortUnits: "ALL" })
     }
   );
 }
@@ -47,7 +58,7 @@ async function cancelAll(symbol) {
       if (o.instrument === symbol) {
         await fetchJSON(
           `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
-          { method:"PUT", headers: auth }
+          { method: "PUT", headers: auth }
         );
       }
     }
@@ -62,13 +73,13 @@ async function placeLimit(symbol, units, entry, sl, tp) {
       headers: auth,
       body: JSON.stringify({
         order: {
-          type:"LIMIT",
-          instrument:symbol,
-          units:units.toString(),
-          price:fmt(entry,symbol),
-          timeInForce:"GTC",
-          stopLossOnFill:{ price:fmt(sl,symbol) },
-          takeProfitOnFill:{ price:fmt(tp,symbol) }
+          type: "LIMIT",
+          instrument: symbol,
+          units: units.toString(),
+          price: fmt(entry, symbol),
+          timeInForce: "GTC",
+          stopLossOnFill: { price: fmt(sl, symbol) },
+          takeProfitOnFill: { price: fmt(tp, symbol) }
         }
       })
     }
@@ -84,22 +95,36 @@ app.post("/webhook", async (req, res) => {
 
   const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice } = payload;
 
-  // ===== ゾーン切替：即時強制 =====
+  // ==============================
+  // ゾーン切替：指値キャンセル最優先
+  // ==============================
   if (alert === "ZONE_EXIT") {
     await cancelAll(symbol);
-    await closeAll(symbol);
-    return res.json({ ok:true });
+
+    // ポジションがある時だけ決済
+    if (await hasPosition(symbol)) {
+      await closeAll(symbol);
+    }
+
+    return res.json({ ok: true });
   }
 
-  // ===== ENTRY =====
+  // ==============================
+  // ENTRY
+  // ==============================
   const units =
     alert === "LONG_LIMIT"  ?  FIXED_UNITS :
     alert === "SHORT_LIMIT" ? -FIXED_UNITS : 0;
 
-  if (!units) return res.json({ skipped:true });
+  if (!units) return res.json({ skipped: true });
 
+  // 既存指値は消す
   await cancelAll(symbol);
-  await closeAll(symbol);
+
+  // すでにポジションがあればクローズ
+  if (await hasPosition(symbol)) {
+    await closeAll(symbol);
+  }
 
   await placeLimit(
     symbol,
@@ -109,7 +134,7 @@ app.post("/webhook", async (req, res) => {
     Number(takeProfitPrice)
   );
 
-  res.json({ ok:true });
+  res.json({ ok: true });
 });
 
 app.listen(PORT, () =>
