@@ -28,7 +28,7 @@ async function fetchJSON(url, options = {}) {
 }
 
 // ==============================
-// ポジション有無チェック（追加）
+// ポジション有無チェック
 // ==============================
 async function hasPosition(symbol) {
   const r = await fetchJSON(
@@ -38,33 +38,45 @@ async function hasPosition(symbol) {
   return (r.positions ?? []).some(p => p.instrument === symbol);
 }
 
+// ==============================
+// 全決済
+// ==============================
 async function closeAll(symbol) {
   return fetchJSON(
     `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/positions/${symbol}/close`,
     {
       method: "PUT",
       headers: auth,
-      body: JSON.stringify({ longUnits: "ALL", shortUnits: "ALL" })
+      body: JSON.stringify({
+        longUnits: "ALL",
+        shortUnits: "ALL"
+      })
     }
   );
 }
 
+// ==============================
+// 指値キャンセル
+// ==============================
 async function cancelAll(symbol) {
-  return fetchJSON(
+  const r = await fetchJSON(
     `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/pendingOrders`,
     { method: "GET", headers: auth }
-  ).then(async r => {
-    for (const o of r.orders ?? []) {
-      if (o.instrument === symbol) {
-        await fetchJSON(
-          `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
-          { method: "PUT", headers: auth }
-        );
-      }
+  );
+
+  for (const o of r.orders ?? []) {
+    if (o.instrument === symbol) {
+      await fetchJSON(
+        `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
+        { method: "PUT", headers: auth }
+      );
     }
-  });
+  }
 }
 
+// ==============================
+// LIMIT注文
+// ==============================
 async function placeLimit(symbol, units, entry, sl, tp) {
   return fetchJSON(
     `${OANDA_API_URL}/${OANDA_ACCOUNT_ID}/orders`,
@@ -78,30 +90,47 @@ async function placeLimit(symbol, units, entry, sl, tp) {
           units: units.toString(),
           price: fmt(entry, symbol),
           timeInForce: "GTC",
-          stopLossOnFill: { price: fmt(sl, symbol) },
-          takeProfitOnFill: { price: fmt(tp, symbol) }
+          positionFill: "DEFAULT",
+          stopLossOnFill: {
+            price: fmt(sl, symbol)
+          },
+          takeProfitOnFill: {
+            price: fmt(tp, symbol)
+          }
         }
       })
     }
   );
 }
 
+// ==================================================
+// WEBHOOK
+// ==================================================
 app.post("/webhook", async (req, res) => {
+
   const payload = req.body.alert_message
     ? JSON.parse(req.body.alert_message)
     : req.body;
 
   console.log("📬 WEBHOOK:", payload);
 
-  const { alert, symbol, entryPrice, stopLossPrice, takeProfitPrice } = payload;
+  const {
+    alert,
+    symbol,
+    entryPrice,
+    stopLossPrice,
+    takeProfitPrice
+  } = payload;
 
   // ==============================
-  // ゾーン切替：指値キャンセル最優先
+  // ZONE EXIT（決済専用）
   // ==============================
   if (alert === "ZONE_EXIT") {
+
+    // まず未約定指値を消す
     await cancelAll(symbol);
 
-    // ポジションがある時だけ決済
+    // ポジションがあれば決済
     if (await hasPosition(symbol)) {
       await closeAll(symbol);
     }
@@ -110,21 +139,21 @@ app.post("/webhook", async (req, res) => {
   }
 
   // ==============================
-  // ENTRY
+  // ENTRY（★ここが修正点）
   // ==============================
+
   const units =
     alert === "LONG_LIMIT"  ?  FIXED_UNITS :
     alert === "SHORT_LIMIT" ? -FIXED_UNITS : 0;
 
   if (!units) return res.json({ skipped: true });
 
-  // 既存指値は消す
+  // 既存指値のみキャンセル
   await cancelAll(symbol);
 
-  // すでにポジションがあればクローズ
-  if (await hasPosition(symbol)) {
-    await closeAll(symbol);
-  }
+  // ❌ ここでcloseしない（超重要）
+  // ENTRYでは決済しない
+  // ZONE_EXITでのみ決済する
 
   await placeLimit(
     symbol,
@@ -134,9 +163,9 @@ app.post("/webhook", async (req, res) => {
     Number(takeProfitPrice)
   );
 
-  res.json({ ok: true });
+  return res.json({ ok: true });
 });
 
 app.listen(PORT, () =>
-  console.log(`🚀 Zone + RR AutoTrade SAFE BOT running`)
+  console.log("🚀 Zone + RR AutoTrade SAFE BOT running")
 );
