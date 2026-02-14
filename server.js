@@ -17,6 +17,7 @@ const auth = {
   "Content-Type": "application/json"
 };
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (p, s) => Number(p).toFixed(PRECISION[s] ?? 3);
 
 async function fetchJSON(url, options = {}) {
@@ -122,24 +123,35 @@ app.post("/webhook", async (req, res) => {
     takeProfitPrice
   } = payload;
 
+  if (!symbol) return res.json({ skipped: true });
+
   // ==============================
   // ZONE EXIT（決済専用）
   // ==============================
   if (alert === "ZONE_EXIT") {
 
-    // まず未約定指値を消す
+    console.log("🚪 ZONE_EXIT 受信");
+
     await cancelAll(symbol);
 
-    // ポジションがあれば決済
     if (await hasPosition(symbol)) {
       await closeAll(symbol);
+
+      // 完全クローズ確認ループ
+      let retry = 0;
+      while (await hasPosition(symbol) && retry < 10) {
+        console.log("⏳ クローズ待機中...");
+        await sleep(500);
+        retry++;
+      }
     }
 
+    console.log("✅ EXIT 完了");
     return res.json({ ok: true });
   }
 
   // ==============================
-  // ENTRY（★ここが修正点）
+  // ENTRY（完全クローズ保証版）
   // ==============================
 
   const units =
@@ -148,13 +160,30 @@ app.post("/webhook", async (req, res) => {
 
   if (!units) return res.json({ skipped: true });
 
-  // 既存指値のみキャンセル
+  console.log("📥 ENTRY 受信");
+
+  // ① 未約定指値キャンセル
   await cancelAll(symbol);
 
-  // ❌ ここでcloseしない（超重要）
-  // ENTRYでは決済しない
-  // ZONE_EXITでのみ決済する
+  // ② 既存ポジションがあれば必ずクローズ
+  if (await hasPosition(symbol)) {
 
+    console.log("🔁 反転前ポジションクローズ");
+
+    await closeAll(symbol);
+
+    // ③ 完全ゼロ確認
+    let retry = 0;
+    while (await hasPosition(symbol) && retry < 10) {
+      console.log("⏳ ポジション消滅待機...");
+      await sleep(500);
+      retry++;
+    }
+
+    console.log("✅ ポジションゼロ確認");
+  }
+
+  // ④ 新規指値発注
   await placeLimit(
     symbol,
     units,
@@ -162,6 +191,8 @@ app.post("/webhook", async (req, res) => {
     Number(stopLossPrice),
     Number(takeProfitPrice)
   );
+
+  console.log("🚀 新規指値発注完了");
 
   return res.json({ ok: true });
 });
