@@ -36,38 +36,66 @@ async function fetchJSON(url, options = {}) {
 }
 
 // ==============================
-async function hasPosition(symbol) {
+// 現在ポジション取得（units付き）
+// ==============================
+async function getPosition(symbol) {
   const r = await fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/openPositions`,
     { method: "GET", headers: auth }
   );
-  return (r.positions ?? []).some(p => p.instrument === symbol);
+
+  const pos = (r.positions ?? []).find(p => p.instrument === symbol);
+  if (!pos) return null;
+
+  return {
+    long: parseInt(pos.long.units),
+    short: parseInt(pos.short.units)
+  };
 }
 
 // ==============================
-// 成り行きクローズ（成功確認付き）
+// NETTING口座用 成り行きクローズ
 // ==============================
 async function closeAllSafe(symbol) {
 
-  const r = await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/positions/${symbol}/close`,
-    {
-      method: "PUT",
-      headers: auth,
-      body: JSON.stringify({
-        longUnits: "ALL",
-        shortUnits: "ALL"
-      })
-    }
-  );
-
-  // 成功判定（トランザクション確認）
-  if (r.longOrderFillTransaction || r.shortOrderFillTransaction) {
-    console.log("✅ 成り行き決済トランザクション確認");
+  const pos = await getPosition(symbol);
+  if (!pos) {
+    console.log("ℹ ポジション無し");
     return true;
   }
 
-  console.log("❌ 成り行き決済失敗の可能性");
+  let unitsToClose = 0;
+
+  if (pos.long > 0) unitsToClose = -pos.long;
+  if (pos.short < 0) unitsToClose = -pos.short;
+
+  if (unitsToClose === 0) return true;
+
+  const body = {
+    order: {
+      type: "MARKET",
+      instrument: symbol,
+      units: unitsToClose.toString(),
+      timeInForce: "FOK",
+      positionFill: "DEFAULT"
+    }
+  };
+
+  const r = await fetchJSON(
+    `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
+    {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify(body)
+    }
+  );
+
+  if (r.orderFillTransaction) {
+    console.log("✅ MARKETクローズ成功");
+    return true;
+  }
+
+  console.log("❌ MARKETクローズ失敗");
   return false;
 }
 
@@ -104,7 +132,7 @@ async function placeLimit(symbol, units, entry, sl, tp) {
           units: units.toString(),
           price: fmt(entry, symbol),
           timeInForce: "GTC",
-          positionFill: "OPEN_ONLY", // 🔥 相殺完全防止
+          positionFill: "OPEN_ONLY",
           stopLossOnFill: { price: fmt(sl, symbol) },
           takeProfitOnFill: { price: fmt(tp, symbol) }
         }
@@ -154,32 +182,14 @@ app.post("/webhook", async (req, res) => {
 
       await cancelAll(symbol);
 
-      if (await hasPosition(symbol)) {
+      const success = await closeAllSafe(symbol);
 
-        const success = await closeAllSafe(symbol);
-
-        if (!success) {
-          console.log("❌ 成り行き失敗 → 強制終了");
-          return res.status(500).json({ error: "close failed" });
-        }
-
-        // 完全ゼロ確認
-        let retry = 0;
-        while (await hasPosition(symbol) && retry < 20) {
-          await sleep(500);
-          retry++;
-        }
-
-        if (await hasPosition(symbol)) {
-          console.log("❌ ポジション消えない → エントリー禁止");
-          return res.status(500).json({ error: "position not cleared" });
-        }
-
-        console.log("✅ ポジション完全ゼロ確認");
-
-        await sleep(POST_CLOSE_WAIT);
-        lastCloseTime = Date.now();
+      if (!success) {
+        return res.status(500).json({ error: "close failed" });
       }
+
+      await sleep(POST_CLOSE_WAIT);
+      lastCloseTime = Date.now();
 
       return res.json({ ok: true });
     }
@@ -187,7 +197,6 @@ app.post("/webhook", async (req, res) => {
     // ==============================
     // ENTRY
     // ==============================
-
     const units =
       alert === "LONG_LIMIT"  ?  FIXED_UNITS :
       alert === "SHORT_LIMIT" ? -FIXED_UNITS : 0;
@@ -201,26 +210,16 @@ app.post("/webhook", async (req, res) => {
 
     await cancelAll(symbol);
 
-    if (await hasPosition(symbol)) {
+    const pos = await getPosition(symbol);
+
+    if (pos && (pos.long !== 0 || pos.short !== 0)) {
 
       console.log("🔁 反転処理開始");
 
       const success = await closeAllSafe(symbol);
 
       if (!success) {
-        console.log("❌ 成り行き失敗 → 新規禁止");
         return res.status(500).json({ error: "close failed" });
-      }
-
-      let retry = 0;
-      while (await hasPosition(symbol) && retry < 20) {
-        await sleep(500);
-        retry++;
-      }
-
-      if (await hasPosition(symbol)) {
-        console.log("❌ ポジション残存 → エントリー中止");
-        return res.status(500).json({ error: "position not cleared" });
       }
 
       await sleep(POST_CLOSE_WAIT);
@@ -255,5 +254,5 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.listen(PORT, () =>
-  console.log("🚀 Zone Ultra Safe Institutional Version running")
+  console.log("🚀 Zone Ultra Safe Institutional Version running (NETTING FIXED)")
 );
