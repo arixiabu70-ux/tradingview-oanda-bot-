@@ -16,7 +16,10 @@ const COOLDOWN_MS = 8000;
 const POST_CLOSE_WAIT = 3000;
 
 let processing = false;
-let lastCloseTime = 0;
+
+// 🔥 変更：エントリー基準で管理
+let lastEntryTime = 0;
+let lastEntrySide = null;
 
 const auth = {
   Authorization: `Bearer ${OANDA_API_KEY}`,
@@ -26,7 +29,7 @@ const auth = {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (p, s) => Number(p).toFixed(PRECISION[s] ?? 3);
 
-// ==============================
+// ==================================================
 async function fetchJSON(url, options = {}) {
   const res = await fetch(url, options);
   const text = await res.text();
@@ -35,9 +38,7 @@ async function fetchJSON(url, options = {}) {
   try { return JSON.parse(text); } catch { return {}; }
 }
 
-// ==============================
-// 現在ポジション取得（units付き）
-// ==============================
+// ==================================================
 async function getPosition(symbol) {
   const r = await fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/openPositions`,
@@ -53,9 +54,7 @@ async function getPosition(symbol) {
   };
 }
 
-// ==============================
-// NETTING口座用 成り行きクローズ
-// ==============================
+// ==================================================
 async function closeAllSafe(symbol) {
 
   const pos = await getPosition(symbol);
@@ -99,7 +98,7 @@ async function closeAllSafe(symbol) {
   return false;
 }
 
-// ==============================
+// ==================================================
 async function cancelAll(symbol) {
 
   const r = await fetchJSON(
@@ -117,7 +116,7 @@ async function cancelAll(symbol) {
   }
 }
 
-// ==============================
+// ==================================================
 async function placeLimit(symbol, units, entry, sl, tp) {
 
   return fetchJSON(
@@ -141,8 +140,12 @@ async function placeLimit(symbol, units, entry, sl, tp) {
   );
 }
 
-function cooldownActive() {
-  return Date.now() - lastCloseTime < COOLDOWN_MS;
+// ==================================================
+// 🔥 同方向のみクールダウン
+function cooldownActive(side) {
+  if (!lastEntrySide) return false;
+  if (side !== lastEntrySide) return false;
+  return Date.now() - lastEntryTime < COOLDOWN_MS;
 }
 
 // ==================================================
@@ -173,9 +176,9 @@ app.post("/webhook", async (req, res) => {
 
     if (!symbol) return res.json({ skipped: true });
 
-    // ==============================
-    // ZONE_EXIT
-    // ==============================
+    // ==================================================
+    // ZONE_EXIT（反転確定時）
+    // ==================================================
     if (alert === "ZONE_EXIT") {
 
       console.log("🚪 ZONE_EXIT");
@@ -183,28 +186,32 @@ app.post("/webhook", async (req, res) => {
       await cancelAll(symbol);
 
       const success = await closeAllSafe(symbol);
-
       if (!success) {
         return res.status(500).json({ error: "close failed" });
       }
 
       await sleep(POST_CLOSE_WAIT);
-      lastCloseTime = Date.now();
+
+      // 🔥 クールダウンは発動しない
+      lastEntrySide = null;
 
       return res.json({ ok: true });
     }
 
-    // ==============================
+    // ==================================================
     // ENTRY
-    // ==============================
-    const units =
-      alert === "LONG_LIMIT"  ?  FIXED_UNITS :
-      alert === "SHORT_LIMIT" ? -FIXED_UNITS : 0;
+    // ==================================================
+    const side =
+      alert === "LONG_LIMIT"  ? "LONG" :
+      alert === "SHORT_LIMIT" ? "SHORT" : null;
 
-    if (!units) return res.json({ skipped: true });
+    if (!side) return res.json({ skipped: true });
 
-    if (cooldownActive()) {
-      console.log("⏳ クールダウン中");
+    const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
+
+    // 🔥 同方向のみブロック
+    if (cooldownActive(side)) {
+      console.log("⏳ 同方向クールダウン中");
       return res.json({ skipped: true });
     }
 
@@ -212,25 +219,27 @@ app.post("/webhook", async (req, res) => {
 
     const pos = await getPosition(symbol);
 
-    if (pos && (pos.long !== 0 || pos.short !== 0)) {
+    // ==================================================
+    // 反対ポジがある場合のみクローズ
+    // ==================================================
+    if (pos && (
+      (side === "LONG"  && pos.short < 0) ||
+      (side === "SHORT" && pos.long  > 0)
+    )) {
 
-      console.log("🔁 反転処理開始");
+      console.log("🔁 反転エントリー");
 
       const success = await closeAllSafe(symbol);
-
       if (!success) {
         return res.status(500).json({ error: "close failed" });
       }
 
       await sleep(POST_CLOSE_WAIT);
-      lastCloseTime = Date.now();
     }
 
-    if (cooldownActive()) {
-      console.log("⏳ 反転直後クールダウン");
-      return res.json({ skipped: true });
-    }
-
+    // ==================================================
+    // LIMIT発注
+    // ==================================================
     await placeLimit(
       symbol,
       units,
@@ -240,6 +249,9 @@ app.post("/webhook", async (req, res) => {
     );
 
     console.log("🚀 新規LIMIT発注完了");
+
+    lastEntryTime = Date.now();
+    lastEntrySide = side;
 
     return res.json({ ok: true });
 
@@ -254,5 +266,5 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.listen(PORT, () =>
-  console.log("🚀 Zone Ultra Safe Institutional Version running (NETTING FIXED)")
+  console.log("🚀 Zone Ultra Safe Institutional Version v6 (Reversal Cooldown Fixed)")
 );
