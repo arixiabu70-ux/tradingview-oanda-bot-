@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 8080;
 const { OANDA_ACCOUNT_ID, OANDA_API_KEY } = process.env;
 
 const BASE = "https://api-fxtrade.oanda.com/v3/accounts";
-const FIXED_UNITS = 20000;
+const FIXED_UNITS = 25000;
 
 const PRECISION = { USD_JPY: 3 };
 
