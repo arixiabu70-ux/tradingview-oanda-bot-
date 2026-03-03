@@ -4,200 +4,160 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
-const { OANDA_ACCOUNT_ID, OANDA_API_KEY } = process.env;
-
-const BASE = "https://api-fxtrade.oanda.com/v3/accounts";
-const FIXED_UNITS = 25000;
-
-const RR_MULTIPLIER = 2;   // ← RR固定値
-const PRECISION = { USD_JPY: 3 };
-
-const COOLDOWN_MS = 8000;
-const POST_CLOSE_WAIT = 3000;
-
-let processing = false;
-let lastEntryTime = 0;
-let lastEntrySide = null;
-
+/* ====== 環境変数 ====== */
+const OANDA_ACCOUNT_ID = process.env.OANDA_ACCOUNT_ID;
+const OANDA_API_KEY = process.env.OANDA_API_KEY;
+const BASE = "https://api-fxtrade.oanda.com/v3";
 const auth = {
   Authorization: `Bearer ${OANDA_API_KEY}`,
   "Content-Type": "application/json"
 };
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const fmt = (p, s) => Number(p).toFixed(PRECISION[s] ?? 3);
+const RR = 2.0;
+const POST_CLOSE_WAIT = 1200;
+const POST_ORDER_WAIT = 1200;
 
-//==================================================
-async function fetchJSON(url, options = {}) {
+/* ====== ユーティリティ ====== */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchJSON(url, options) {
   const res = await fetch(url, options);
   const text = await res.text();
-  console.log(`📡 ${options.method} ${url}`);
-  console.log(`📥 [${res.status}] ${text}`);
-  try { return JSON.parse(text); } catch { return {}; }
+  if (!res.ok) {
+    console.error("❌ OANDA ERROR:", text);
+    throw new Error(text);
+  }
+  return JSON.parse(text);
 }
 
-//==================================================
 async function getOpenTrade(symbol) {
-  const r = await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/openTrades`,
-    { method: "GET", headers: auth }
+  const data = await fetchJSON(
+    `${BASE}/accounts/${OANDA_ACCOUNT_ID}/openTrades`,
+    { headers: auth }
   );
-  return (r.trades ?? []).find(t => t.instrument === symbol);
+  return data.trades.find((t) => t.instrument === symbol);
 }
 
-//==================================================
-async function setTakeProfit(symbol) {
+/* ====== 反対ポジ強制クローズ ====== */
+async function closeOppositePosition(symbol, side) {
+  const pos = await getOpenTrade(symbol);
+  if (!pos) return;
 
-  // 最大10秒待って約定確認
-  let trade = null;
-  for (let i = 0; i < 10; i++) {
-    await sleep(1000);
-    trade = await getOpenTrade(symbol);
-    if (trade) break;
-  }
+  const currentUnits = Number(pos.currentUnits);
 
-  if (!trade) {
-    console.log("⚠ 約定確認できず TP未設定");
-    return;
-  }
+  if (
+    (side === "LONG" && currentUnits < 0) ||
+    (side === "SHORT" && currentUnits > 0)
+  ) {
+    console.log("🔁 反対ポジ検出 → 強制クローズ");
 
-  const entry = Number(trade.price);
-  const sl = Number(trade.stopLossOrder.price);
-  const units = Number(trade.currentUnits);
-
-  const risk = Math.abs(entry - sl);
-  const tp = units > 0
-    ? entry + risk * RR_MULTIPLIER
-    : entry - risk * RR_MULTIPLIER;
-
-  await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
-    {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        order: {
-          type: "TAKE_PROFIT",
-          tradeID: trade.id,
-          price: fmt(tp, symbol),
-          timeInForce: "GTC"
-        }
-      })
-    }
-  );
-
-  console.log("✅ TP再計算セット完了:", tp);
-}
-
-//==================================================
-async function placeLimit(symbol, units, entry, sl) {
-
-  return fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
-    {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        order: {
-          type: "LIMIT",
-          instrument: symbol,
-          units: units.toString(),
-          price: fmt(entry, symbol),
-          timeInForce: "GTC",
-          positionFill: "OPEN_ONLY",
-          stopLossOnFill: { price: fmt(sl, symbol) }
-        }
-      })
-    }
-  );
-}
-
-//==================================================
-function cooldownActive(side) {
-  if (!lastEntrySide) return false;
-  if (side !== lastEntrySide) return false;
-  return Date.now() - lastEntryTime < COOLDOWN_MS;
-}
-
-//==================================================
-app.post("/webhook", async (req, res) => {
-
-  if (processing) {
-    return res.json({ skipped: true });
-  }
-
-  processing = true;
-
-  try {
-
-    const payload = req.body.alert_message
-      ? JSON.parse(req.body.alert_message)
-      : req.body;
-
-    const {
-      alert,
-      symbol,
-      entryPrice,
-      stopLossPrice
-    } = payload;
-
-    if (!symbol) return res.json({ skipped: true });
-
-    if (alert === "ZONE_EXIT") {
-
-      await fetchJSON(
-        `${BASE}/${OANDA_ACCOUNT_ID}/positions/${symbol}/close`,
-        {
-          method: "PUT",
-          headers: auth,
-          body: JSON.stringify({ longUnits: "ALL", shortUnits: "ALL" })
-        }
-      );
-
-      lastEntrySide = null;
-      return res.json({ ok: true });
-    }
-
-    const side =
-      alert === "LONG_LIMIT"  ? "LONG" :
-      alert === "SHORT_LIMIT" ? "SHORT" : null;
-
-    if (!side) return res.json({ skipped: true });
-
-    if (cooldownActive(side)) {
-      return res.json({ skipped: true });
-    }
-
-    const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
-
-    await placeLimit(
-      symbol,
-      units,
-      Number(entryPrice),
-      Number(stopLossPrice)
+    await fetchJSON(
+      `${BASE}/accounts/${OANDA_ACCOUNT_ID}/positions/${symbol}/close`,
+      {
+        method: "PUT",
+        headers: auth,
+        body: JSON.stringify({
+          longUnits: "ALL",
+          shortUnits: "ALL"
+        })
+      }
     );
 
-    console.log("🚀 LIMIT発注完了（SLのみ）");
+    await sleep(POST_CLOSE_WAIT);
+  }
+}
 
-    // 🔥 約定後TP再計算
-    await setTakeProfit(symbol);
+/* ====== LIMIT発注（SLのみ） ====== */
+async function placeLimit(symbol, side, units, entryPrice, slPrice) {
+  const order = {
+    order: {
+      type: "LIMIT",
+      instrument: symbol,
+      units: side === "LONG" ? units : -units,
+      price: entryPrice.toFixed(3),
+      timeInForce: "GTC",
+      positionFill: "DEFAULT",
+      stopLossOnFill: {
+        price: slPrice.toFixed(3)
+      }
+    }
+  };
 
-    lastEntryTime = Date.now();
-    lastEntrySide = side;
+  return await fetchJSON(
+    `${BASE}/accounts/${OANDA_ACCOUNT_ID}/orders`,
+    {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify(order)
+    }
+  );
+}
 
-    return res.json({ ok: true });
+/* ====== 約定待ち ====== */
+async function waitForFill(symbol) {
+  for (let i = 0; i < 10; i++) {
+    await sleep(1000);
+    const trade = await getOpenTrade(symbol);
+    if (trade) return trade;
+  }
+  throw new Error("約定確認できませんでした");
+}
+
+/* ====== TP再設定 ====== */
+async function setTakeProfit(trade, side) {
+  const entry = Number(trade.price);
+  const sl = Number(trade.stopLossOrder.price);
+  const risk = Math.abs(entry - sl);
+  const tp =
+    side === "LONG"
+      ? entry + risk * RR
+      : entry - risk * RR;
+
+  console.log("🎯 TP再計算:", tp.toFixed(3));
+
+  await fetchJSON(
+    `${BASE}/accounts/${OANDA_ACCOUNT_ID}/trades/${trade.id}/orders`,
+    {
+      method: "PUT",
+      headers: auth,
+      body: JSON.stringify({
+        takeProfit: {
+          price: tp.toFixed(3)
+        }
+      })
+    }
+  );
+}
+
+/* ====== Webhook受信 ====== */
+app.post("/webhook", async (req, res) => {
+  try {
+    const { symbol, side, units, entryPrice, slPrice } = req.body;
+
+    console.log("📩 Webhook:", req.body);
+
+    // ① 反対ポジがあればクローズ
+    await closeOppositePosition(symbol, side);
+
+    // ② LIMIT発注
+    await placeLimit(symbol, side, units, entryPrice, slPrice);
+
+    await sleep(POST_ORDER_WAIT);
+
+    // ③ 約定確認
+    const trade = await waitForFill(symbol);
+
+    // ④ TP再計算
+    await setTakeProfit(trade, side);
+
+    res.json({ status: "OK" });
 
   } catch (err) {
-
-    console.error("❌ ERROR:", err);
-    return res.status(500).json({ error: true });
-
-  } finally {
-    processing = false;
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () =>
-  console.log("🚀 Zone Ultra Safe Institutional Version v7 (True RR Fixed)")
-);
+app.listen(3000, () => {
+  console.log("🚀 Server running on port 3000");
+});
