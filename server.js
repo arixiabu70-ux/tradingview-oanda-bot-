@@ -62,6 +62,20 @@ async function getPosition(symbol) {
 }
 
 // ==================================================
+async function cancelPendingIfNoPosition(symbol) {
+
+  const pos = await getPosition(symbol);
+
+  if (pos && (pos.long !== 0 || pos.short !== 0)) {
+    console.log("⚠ ポジションあるため pending キャンセルしない");
+    return;
+  }
+
+  await cancelAll(symbol);
+
+}
+
+// ==================================================
 async function closeAllSafe(symbol) {
 
   const pos = await getPosition(symbol);
@@ -130,7 +144,16 @@ async function cancelAll(symbol) {
 }
 
 // ==================================================
-async function placeLimit(symbol, units, entry) {
+async function placeLimit(symbol, units, entry, slPrice, side) {
+
+  const risk = Math.abs(entry - slPrice);
+
+  let tp;
+
+  if (side === "LONG")
+    tp = entry + risk * RR;
+  else
+    tp = entry - risk * RR;
 
   return fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
@@ -144,60 +167,20 @@ async function placeLimit(symbol, units, entry) {
           units: units.toString(),
           price: fmt(entry, symbol),
           timeInForce: "GTC",
-          positionFill: "OPEN_ONLY"
+          positionFill: "OPEN_ONLY",
+
+          takeProfitOnFill: {
+            price: fmt(tp, symbol)
+          },
+
+          stopLossOnFill: {
+            price: fmt(slPrice, symbol)
+          }
+
         }
       })
     }
   );
-}
-
-// ==================================================
-// 約定価格取得
-async function getLastFill(symbol) {
-
-  const r = await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/trades?instrument=${symbol}&count=1`,
-    { method: "GET", headers: auth }
-  );
-
-  if (!r.trades || r.trades.length === 0) return null;
-
-  return r.trades[0];
-}
-
-// ==================================================
-async function attachTPSL(symbol, tradeID, entry, slPrice, side) {
-
-  const risk = Math.abs(entry - slPrice);
-
-  let tp;
-
-  if (side === "LONG")
-    tp = entry + risk * RR;
-  else
-    tp = entry - risk * RR;
-
-  const body = {
-    stopLoss: {
-      price: fmt(slPrice, symbol),
-      timeInForce: "GTC"
-    },
-    takeProfit: {
-      price: fmt(tp, symbol),
-      timeInForce: "GTC"
-    }
-  };
-
-  await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/trades/${tradeID}/orders`,
-    {
-      method: "PUT",
-      headers: auth,
-      body: JSON.stringify(body)
-    }
-  );
-
-  console.log("🎯 TP/SL後付け完了");
 }
 
 // ==================================================
@@ -240,7 +223,7 @@ app.post("/webhook", async (req, res) => {
 
       console.log("🚪 ZONE_EXIT");
 
-      await cancelAll(symbol);
+      await cancelPendingIfNoPosition(symbol);
 
       const success = await closeAllSafe(symbol);
 
@@ -268,7 +251,7 @@ app.post("/webhook", async (req, res) => {
       return res.json({ skipped: true });
     }
 
-    await cancelAll(symbol);
+    await cancelPendingIfNoPosition(symbol);
 
     const pos = await getPosition(symbol);
 
@@ -287,27 +270,15 @@ app.post("/webhook", async (req, res) => {
       await sleep(POST_CLOSE_WAIT);
     }
 
-    await placeLimit(symbol, units, Number(entryPrice));
+    await placeLimit(
+      symbol,
+      units,
+      Number(entryPrice),
+      Number(stopLossPrice),
+      side
+    );
 
     console.log("📌 LIMIT発注");
-
-    await sleep(2000);
-
-    const trade = await getLastFill(symbol);
-
-    if (trade) {
-
-      const entry = Number(trade.price);
-
-      await attachTPSL(
-        symbol,
-        trade.id,
-        entry,
-        Number(stopLossPrice),
-        side
-      );
-
-    }
 
     lastEntryTime = Date.now();
     lastEntrySide = side;
