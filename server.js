@@ -1,4 +1,3 @@
-```javascript
 import express from "express";
 import fetch from "node-fetch";
 
@@ -237,7 +236,6 @@ app.post("/webhook", async (req, res) => {
 
     if (!symbol) return res.json({ skipped: true });
 
-    // ==================================================
     if (alert === "ZONE_EXIT") {
 
       console.log("🚪 ZONE_EXIT");
@@ -257,7 +255,6 @@ app.post("/webhook", async (req, res) => {
 
     }
 
-    // ==================================================
     const side =
       alert === "LONG_LIMIT" ? "LONG" :
       alert === "SHORT_LIMIT" ? "SHORT" : null;
@@ -333,4 +330,3 @@ app.post("/webhook", async (req, res) => {
 app.listen(PORT, () =>
   console.log("🚀 Zone Ultra Safe Institutional Version v7 (Real Fill RR)")
 );
-```
