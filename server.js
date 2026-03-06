@@ -1,219 +1,336 @@
+```javascript
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-/* ===== 環境変数 ===== */
 const PORT = process.env.PORT || 8080;
-const OANDA_ACCOUNT_ID = process.env.OANDA_ACCOUNT_ID;
-const OANDA_API_KEY = process.env.OANDA_API_KEY;
+const { OANDA_ACCOUNT_ID, OANDA_API_KEY } = process.env;
 
-/* ===== 設定 ===== */
 const BASE = "https://api-fxtrade.oanda.com/v3/accounts";
 const FIXED_UNITS = 25000;
-const RR_MULTIPLIER = 2;
 
-const PRECISION = {
-  USD_JPY: 3
-};
+const RR = 2;
 
-/* ===== ヘッダー ===== */
-const headers = {
+const PRECISION = { USD_JPY: 3 };
+
+const COOLDOWN_MS = 8000;
+const POST_CLOSE_WAIT = 3000;
+
+let processing = false;
+
+let lastEntryTime = 0;
+let lastEntrySide = null;
+
+const auth = {
   Authorization: `Bearer ${OANDA_API_KEY}`,
   "Content-Type": "application/json"
 };
 
-/* ===== sleep ===== */
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const fmt = (p, s) => Number(p).toFixed(PRECISION[s] ?? 3);
+
+// ==================================================
+async function fetchJSON(url, options = {}) {
+
+  const res = await fetch(url, options);
+  const text = await res.text();
+
+  console.log(`📡 ${options.method} ${url}`);
+  console.log(`📥 [${res.status}] ${text}`);
+
+  try { return JSON.parse(text); }
+  catch { return {}; }
 }
 
-/* ===============================
-   現在ポジション取得
-================================ */
+// ==================================================
 async function getPosition(symbol) {
 
-  const res = await fetch(
-    `${BASE}/${OANDA_ACCOUNT_ID}/positions/${symbol}`,
-    { headers }
+  const r = await fetchJSON(
+    `${BASE}/${OANDA_ACCOUNT_ID}/openPositions`,
+    { method: "GET", headers: auth }
   );
 
-  const data = await res.json();
+  const pos = (r.positions ?? []).find(p => p.instrument === symbol);
 
-  if (!data.position) return "NONE";
+  if (!pos) return null;
 
-  const longUnits = Number(data.position.long.units);
-  const shortUnits = Number(data.position.short.units);
-
-  if (longUnits > 0) return "LONG";
-  if (shortUnits < 0) return "SHORT";
-
-  return "NONE";
+  return {
+    long: parseInt(pos.long.units),
+    short: parseInt(pos.short.units)
+  };
 }
 
-/* ===============================
-   ポジション決済
-================================ */
-async function closePosition(symbol) {
+// ==================================================
+async function closeAllSafe(symbol) {
 
-  const res = await fetch(
-    `${BASE}/${OANDA_ACCOUNT_ID}/positions/${symbol}`,
-    { headers }
-  );
+  const pos = await getPosition(symbol);
 
-  const data = await res.json();
-
-  if (!data.position) {
-    console.log("ポジションなし");
-    return;
+  if (!pos) {
+    console.log("ℹ ポジション無し");
+    return true;
   }
 
-  const longUnits = Number(data.position.long.units);
-  const shortUnits = Number(data.position.short.units);
+  let unitsToClose = 0;
 
-  let body = {};
+  if (pos.long > 0) unitsToClose = -pos.long;
+  if (pos.short < 0) unitsToClose = -pos.short;
 
-  if (longUnits > 0) {
-    body.longUnits = "ALL";
-  }
+  if (unitsToClose === 0) return true;
 
-  if (shortUnits < 0) {
-    body.shortUnits = "ALL";
-  }
+  const body = {
+    order: {
+      type: "MARKET",
+      instrument: symbol,
+      units: unitsToClose.toString(),
+      timeInForce: "FOK",
+      positionFill: "DEFAULT"
+    }
+  };
 
-  if (Object.keys(body).length === 0) {
-    console.log("決済するポジションなし");
-    return;
-  }
-
-  console.log("決済送信:", body);
-
-  const resClose = await fetch(
-    `${BASE}/${OANDA_ACCOUNT_ID}/positions/${symbol}/close`,
+  const r = await fetchJSON(
+    `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
     {
-      method: "PUT",
-      headers,
+      method: "POST",
+      headers: auth,
       body: JSON.stringify(body)
     }
   );
 
-  const result = await resClose.json();
+  if (r.orderFillTransaction) {
+    console.log("✅ MARKETクローズ成功");
+    return true;
+  }
 
-  console.log("決済結果:", result);
+  console.log("❌ MARKETクローズ失敗");
+  return false;
 }
 
-/* ===============================
-   注文送信
-================================ */
-async function createOrder(symbol, side, entry, sl, tp) {
+// ==================================================
+async function cancelAll(symbol) {
 
-  const precision = PRECISION[symbol] || 3;
+  const r = await fetchJSON(
+    `${BASE}/${OANDA_ACCOUNT_ID}/pendingOrders`,
+    { method: "GET", headers: auth }
+  );
 
-  const order = {
-    order: {
-      instrument: symbol,
-      units: side === "LONG" ? FIXED_UNITS : -FIXED_UNITS,
-      type: "LIMIT",
-      price: entry.toFixed(precision),
-      timeInForce: "GTC",
-      positionFill: "DEFAULT",
-      stopLossOnFill: {
-        price: sl.toFixed(precision)
-      },
-      takeProfitOnFill: {
-        price: tp.toFixed(precision)
-      }
+  for (const o of r.orders ?? []) {
+
+    if (o.instrument === symbol) {
+
+      await fetchJSON(
+        `${BASE}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
+        { method: "PUT", headers: auth }
+      );
+
     }
-  };
 
-  console.log("注文送信:", order);
+  }
 
-  const res = await fetch(
+}
+
+// ==================================================
+async function placeLimit(symbol, units, entry) {
+
+  return fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
     {
       method: "POST",
-      headers,
-      body: JSON.stringify(order)
+      headers: auth,
+      body: JSON.stringify({
+        order: {
+          type: "LIMIT",
+          instrument: symbol,
+          units: units.toString(),
+          price: fmt(entry, symbol),
+          timeInForce: "GTC",
+          positionFill: "OPEN_ONLY"
+        }
+      })
+    }
+  );
+}
+
+// ==================================================
+// 約定価格取得
+async function getLastFill(symbol) {
+
+  const r = await fetchJSON(
+    `${BASE}/${OANDA_ACCOUNT_ID}/trades?instrument=${symbol}&count=1`,
+    { method: "GET", headers: auth }
+  );
+
+  if (!r.trades || r.trades.length === 0) return null;
+
+  return r.trades[0];
+}
+
+// ==================================================
+async function attachTPSL(symbol, tradeID, entry, slPrice, side) {
+
+  const risk = Math.abs(entry - slPrice);
+
+  let tp;
+
+  if (side === "LONG")
+    tp = entry + risk * RR;
+  else
+    tp = entry - risk * RR;
+
+  const body = {
+    stopLoss: {
+      price: fmt(slPrice, symbol),
+      timeInForce: "GTC"
+    },
+    takeProfit: {
+      price: fmt(tp, symbol),
+      timeInForce: "GTC"
+    }
+  };
+
+  await fetchJSON(
+    `${BASE}/${OANDA_ACCOUNT_ID}/trades/${tradeID}/orders`,
+    {
+      method: "PUT",
+      headers: auth,
+      body: JSON.stringify(body)
     }
   );
 
-  const data = await res.json();
-
-  console.log("注文結果:", data);
+  console.log("🎯 TP/SL後付け完了");
 }
 
-/* ===============================
-   Webhook
-================================ */
+// ==================================================
+function cooldownActive(side) {
+
+  if (!lastEntrySide) return false;
+  if (side !== lastEntrySide) return false;
+
+  return Date.now() - lastEntryTime < COOLDOWN_MS;
+}
+
+// ==================================================
 app.post("/webhook", async (req, res) => {
 
-  console.log("Webhook受信:", req.body);
+  if (processing) {
+    console.log("⚠ 多重Webhook防止");
+    return res.json({ skipped: true });
+  }
 
-  const { alert, symbol, side, entry, sl } = req.body;
+  processing = true;
 
   try {
 
-    /* ===== ゾーン決済 ===== */
+    const payload = req.body.alert_message
+      ? JSON.parse(req.body.alert_message)
+      : req.body;
+
+    console.log("📬 WEBHOOK:", payload);
+
+    const {
+      alert,
+      symbol,
+      entryPrice,
+      stopLossPrice
+    } = payload;
+
+    if (!symbol) return res.json({ skipped: true });
+
+    // ==================================================
     if (alert === "ZONE_EXIT") {
 
-      await closePosition(symbol);
+      console.log("🚪 ZONE_EXIT");
 
-      return res.json({ status: "exit done" });
+      await cancelAll(symbol);
+
+      const success = await closeAllSafe(symbol);
+
+      if (!success)
+        return res.status(500).json({ error: "close failed" });
+
+      await sleep(POST_CLOSE_WAIT);
+
+      lastEntrySide = null;
+
+      return res.json({ ok: true });
+
     }
 
-    /* ===== エントリー ===== */
-    if (alert === "ENTRY") {
+    // ==================================================
+    const side =
+      alert === "LONG_LIMIT" ? "LONG" :
+      alert === "SHORT_LIMIT" ? "SHORT" : null;
 
-      const position = await getPosition(symbol);
+    if (!side) return res.json({ skipped: true });
 
-      console.log("現在ポジション:", position);
+    const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
 
-      if (side === "LONG" && position === "SHORT") {
-
-        await closePosition(symbol);
-        await sleep(800);
-      }
-
-      if (side === "SHORT" && position === "LONG") {
-
-        await closePosition(symbol);
-        await sleep(800);
-      }
-
-      const risk = Math.abs(entry - sl);
-
-      let tp;
-
-      if (side === "LONG") {
-        tp = entry + risk * RR_MULTIPLIER;
-      } else {
-        tp = entry - risk * RR_MULTIPLIER;
-      }
-
-      await createOrder(symbol, side, entry, sl, tp);
-
-      return res.json({ status: "order sent" });
+    if (cooldownActive(side)) {
+      console.log("⏳ 同方向クールダウン");
+      return res.json({ skipped: true });
     }
 
-    res.json({ status: "ignored" });
+    await cancelAll(symbol);
+
+    const pos = await getPosition(symbol);
+
+    if (pos && (
+      (side === "LONG" && pos.short < 0) ||
+      (side === "SHORT" && pos.long > 0)
+    )) {
+
+      console.log("🔁 反転エントリー");
+
+      const success = await closeAllSafe(symbol);
+
+      if (!success)
+        return res.status(500).json({ error: "close failed" });
+
+      await sleep(POST_CLOSE_WAIT);
+    }
+
+    await placeLimit(symbol, units, Number(entryPrice));
+
+    console.log("📌 LIMIT発注");
+
+    await sleep(2000);
+
+    const trade = await getLastFill(symbol);
+
+    if (trade) {
+
+      const entry = Number(trade.price);
+
+      await attachTPSL(
+        symbol,
+        trade.id,
+        entry,
+        Number(stopLossPrice),
+        side
+      );
+
+    }
+
+    lastEntryTime = Date.now();
+    lastEntrySide = side;
+
+    return res.json({ ok: true });
 
   } catch (err) {
 
-    console.error("エラー:", err);
+    console.error("❌ ERROR:", err);
+    return res.status(500).json({ error: true });
 
-    res.status(500).json({
-      error: err.message
-    });
+  } finally {
+
+    processing = false;
+
   }
 
 });
 
-/* ===============================
-   サーバー起動
-================================ */
-app.listen(PORT, () => {
-
-  console.log(`BOT起動ポート ${PORT}`);
-
-});
+app.listen(PORT, () =>
+  console.log("🚀 Zone Ultra Safe Institutional Version v7 (Real Fill RR)")
+);
+```
