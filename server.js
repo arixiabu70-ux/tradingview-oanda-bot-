@@ -10,8 +10,6 @@ const { OANDA_ACCOUNT_ID, OANDA_API_KEY } = process.env;
 const BASE = "https://api-fxtrade.oanda.com/v3/accounts";
 const FIXED_UNITS = 25000;
 
-const RR = 2;
-
 const PRECISION = { USD_JPY: 3 };
 
 const COOLDOWN_MS = 8000;
@@ -41,6 +39,7 @@ async function fetchJSON(url, options = {}) {
 
   try { return JSON.parse(text); }
   catch { return {}; }
+
 }
 
 // ==================================================
@@ -59,6 +58,7 @@ async function getPosition(symbol) {
     long: parseInt(pos.long.units),
     short: parseInt(pos.short.units)
   };
+
 }
 
 // ==================================================
@@ -118,6 +118,7 @@ async function closeAllSafe(symbol) {
 
   console.log("❌ MARKETクローズ失敗");
   return false;
+
 }
 
 // ==================================================
@@ -144,16 +145,7 @@ async function cancelAll(symbol) {
 }
 
 // ==================================================
-async function placeLimit(symbol, units, entry, slPrice, side) {
-
-  const risk = Math.abs(entry - slPrice);
-
-  let tp;
-
-  if (side === "LONG")
-    tp = entry + risk * RR;
-  else
-    tp = entry - risk * RR;
+async function placeLimit(symbol, units, entry, slPrice, tp) {
 
   return fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
@@ -181,6 +173,7 @@ async function placeLimit(symbol, units, entry, slPrice, side) {
       })
     }
   );
+
 }
 
 // ==================================================
@@ -190,6 +183,7 @@ function cooldownActive(side) {
   if (side !== lastEntrySide) return false;
 
   return Date.now() - lastEntryTime < COOLDOWN_MS;
+
 }
 
 // ==================================================
@@ -214,11 +208,15 @@ app.post("/webhook", async (req, res) => {
       alert,
       symbol,
       entryPrice,
-      stopLossPrice
+      stopLossPrice,
+      takeProfitPrice
     } = payload;
 
     if (!symbol) return res.json({ skipped: true });
 
+    // ==================================================
+    // ZONE EXIT
+    // ==================================================
     if (alert === "ZONE_EXIT") {
 
       console.log("🚪 ZONE_EXIT");
@@ -268,6 +266,7 @@ app.post("/webhook", async (req, res) => {
         return res.status(500).json({ error: "close failed" });
 
       await sleep(POST_CLOSE_WAIT);
+
     }
 
     await placeLimit(
@@ -275,7 +274,7 @@ app.post("/webhook", async (req, res) => {
       units,
       Number(entryPrice),
       Number(stopLossPrice),
-      side
+      Number(takeProfitPrice)
     );
 
     console.log("📌 LIMIT発注");
@@ -299,5 +298,5 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.listen(PORT, () =>
-  console.log("🚀 Zone Ultra Safe Institutional Version v7 (Real Fill RR)")
+  console.log("🚀 Zone Ultra Safe Institutional Version v8")
 );
