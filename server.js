@@ -28,9 +28,18 @@ const auth = {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmt = (p, s) => Number(p).toFixed(PRECISION[s] ?? 3);
 
-// ==================================================
-async function fetchJSON(url, options = {}) {
+// =============================
+// シンボル変換
+// =============================
+function normalizeSymbol(sym) {
+  if (sym === "USDJPY") return "USD_JPY";
+  if (sym === "EURJPY") return "EUR_JPY";
+  if (sym === "GBPJPY") return "GBP_JPY";
+  return sym;
+}
 
+// =============================
+async function fetchJSON(url, options = {}) {
   const res = await fetch(url, options);
   const text = await res.text();
 
@@ -39,10 +48,9 @@ async function fetchJSON(url, options = {}) {
 
   try { return JSON.parse(text); }
   catch { return {}; }
-
 }
 
-// ==================================================
+// =============================
 async function getPosition(symbol) {
 
   const r = await fetchJSON(
@@ -61,21 +69,13 @@ async function getPosition(symbol) {
 
 }
 
-// ==================================================
-async function cancelPendingIfNoPosition(symbol) {
-
-  const pos = await getPosition(symbol);
-
-  if (pos && (pos.long !== 0 || pos.short !== 0)) {
-    console.log("⚠ ポジションあるため pending キャンセルしない");
-    return;
-  }
-
-  await cancelAll(symbol);
-
+// =============================
+function hasPosition(pos) {
+  if (!pos) return false;
+  return pos.long !== 0 || pos.short !== 0;
 }
 
-// ==================================================
+// =============================
 async function closeAllSafe(symbol) {
 
   const pos = await getPosition(symbol);
@@ -121,7 +121,7 @@ async function closeAllSafe(symbol) {
 
 }
 
-// ==================================================
+// =============================
 async function cancelAll(symbol) {
 
   const r = await fetchJSON(
@@ -144,7 +144,7 @@ async function cancelAll(symbol) {
 
 }
 
-// ==================================================
+// =============================
 async function placeLimit(symbol, units, entry, slPrice, tp) {
 
   return fetchJSON(
@@ -176,7 +176,7 @@ async function placeLimit(symbol, units, entry, slPrice, tp) {
 
 }
 
-// ==================================================
+// =============================
 function cooldownActive(side) {
 
   if (!lastEntrySide) return false;
@@ -186,12 +186,15 @@ function cooldownActive(side) {
 
 }
 
-// ==================================================
+// =============================
 app.post("/webhook", async (req, res) => {
+
+  // タイムアウト防止
+  res.json({ received: true });
 
   if (processing) {
     console.log("⚠ 多重Webhook防止");
-    return res.json({ skipped: true });
+    return;
   }
 
   processing = true;
@@ -212,65 +215,69 @@ app.post("/webhook", async (req, res) => {
       takeProfitPrice
     } = payload;
 
-    if (!symbol) return res.json({ skipped: true });
+    if (!symbol) return;
 
-    // ==================================================
-    // ZONE EXIT
-    // ==================================================
+    const symbolFixed = normalizeSymbol(symbol);
+
+    // =============================
+    // ZONE EXIT（強制全決済）
+    // =============================
     if (alert === "ZONE_EXIT") {
 
       console.log("🚪 ZONE_EXIT");
 
-      await cancelPendingIfNoPosition(symbol);
-
-      const success = await closeAllSafe(symbol);
-
-      if (!success)
-        return res.status(500).json({ error: "close failed" });
+      await cancelAll(symbolFixed);
+      await closeAllSafe(symbolFixed);
 
       await sleep(POST_CLOSE_WAIT);
 
       lastEntrySide = null;
-
-      return res.json({ ok: true });
-
+      return;
     }
 
     const side =
       alert === "LONG_LIMIT" ? "LONG" :
       alert === "SHORT_LIMIT" ? "SHORT" : null;
 
-    if (!side) return res.json({ skipped: true });
+    if (!side) return;
 
     const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
 
     if (cooldownActive(side)) {
-      console.log("⏳ 同方向クールダウン");
-      return res.json({ skipped: true });
+      console.log("⏳ クールダウン中");
+      return;
     }
 
-    await cancelPendingIfNoPosition(symbol);
+    const pos = await getPosition(symbolFixed);
 
-    const pos = await getPosition(symbol);
+    // =============================
+    // ✅ 1ポジ固定ロジック（ここが核心）
+    // =============================
+    if (hasPosition(pos)) {
 
-    if (pos && (
-      (side === "LONG" && pos.short < 0) ||
-      (side === "SHORT" && pos.long > 0)
-    )) {
+      // 同方向 → 完全スキップ
+      if (
+        (side === "LONG" && pos.long > 0) ||
+        (side === "SHORT" && pos.short < 0)
+      ) {
+        console.log("⛔ 同方向ポジあり → 新規エントリー禁止");
+        return;
+      }
 
+      // 逆方向 → クローズしてから
       console.log("🔁 反転エントリー");
 
-      const success = await closeAllSafe(symbol);
-
-      if (!success)
-        return res.status(500).json({ error: "close failed" });
+      const success = await closeAllSafe(symbolFixed);
+      if (!success) return;
 
       await sleep(POST_CLOSE_WAIT);
-
     }
 
+    // pendingも一旦全部消す（重複防止）
+    await cancelAll(symbolFixed);
+
     await placeLimit(
-      symbol,
+      symbolFixed,
       units,
       Number(entryPrice),
       Number(stopLossPrice),
@@ -282,12 +289,9 @@ app.post("/webhook", async (req, res) => {
     lastEntryTime = Date.now();
     lastEntrySide = side;
 
-    return res.json({ ok: true });
-
   } catch (err) {
 
     console.error("❌ ERROR:", err);
-    return res.status(500).json({ error: true });
 
   } finally {
 
@@ -298,5 +302,5 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.listen(PORT, () =>
-  console.log("🚀 Zone Ultra Safe Institutional Version v8")
+  console.log("🚀 Zone Ultra Safe Institutional v8 ONE POSITION")
 );
