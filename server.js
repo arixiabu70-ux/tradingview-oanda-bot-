@@ -10,8 +10,6 @@ const { OANDA_ACCOUNT_ID, OANDA_API_KEY } = process.env;
 const BASE = "https://api-fxtrade.oanda.com/v3/accounts";
 const FIXED_UNITS = 20000;
 
-const PRECISION = { USD_JPY: 3 };
-
 const COOLDOWN_MS = 8000;
 const POST_CLOSE_WAIT = 3000;
 
@@ -26,7 +24,6 @@ const auth = {
 };
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const fmt = (p, s) => Number(p).toFixed(PRECISION[s] ?? 3);
 
 // =============================
 // シンボル変換
@@ -52,7 +49,6 @@ async function fetchJSON(url, options = {}) {
 
 // =============================
 async function getPosition(symbol) {
-
   const r = await fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/openPositions`,
     { method: "GET", headers: auth }
@@ -66,7 +62,6 @@ async function getPosition(symbol) {
     long: parseInt(pos.long.units),
     short: parseInt(pos.short.units)
   };
-
 }
 
 // =============================
@@ -118,7 +113,6 @@ async function closeAllSafe(symbol) {
 
   console.log("❌ MARKETクローズ失敗");
   return false;
-
 }
 
 // =============================
@@ -130,22 +124,19 @@ async function cancelAll(symbol) {
   );
 
   for (const o of r.orders ?? []) {
-
     if (o.instrument === symbol) {
-
       await fetchJSON(
         `${BASE}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
         { method: "PUT", headers: auth }
       );
-
     }
-
   }
-
 }
 
 // =============================
-async function placeLimit(symbol, units, entry, slPrice, tp) {
+// ★ここが完全修正（LIMIT削除→MARKET化）
+// =============================
+async function placeMarket(symbol, units, slPrice, tp) {
 
   return fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
@@ -154,42 +145,35 @@ async function placeLimit(symbol, units, entry, slPrice, tp) {
       headers: auth,
       body: JSON.stringify({
         order: {
-          type: "LIMIT",
+          type: "MARKET",
           instrument: symbol,
           units: units.toString(),
-          price: fmt(entry, symbol),
-          timeInForce: "GTC",
-          positionFill: "OPEN_ONLY",
+          timeInForce: "FOK",
+          positionFill: "DEFAULT",
 
           takeProfitOnFill: {
-            price: fmt(tp, symbol)
+            price: tp.toString()
           },
 
           stopLossOnFill: {
-            price: fmt(slPrice, symbol)
+            price: slPrice.toString()
           }
-
         }
       })
     }
   );
-
 }
 
 // =============================
 function cooldownActive(side) {
-
   if (!lastEntrySide) return false;
   if (side !== lastEntrySide) return false;
-
   return Date.now() - lastEntryTime < COOLDOWN_MS;
-
 }
 
 // =============================
 app.post("/webhook", async (req, res) => {
 
-  // タイムアウト防止
   res.json({ received: true });
 
   if (processing) {
@@ -220,7 +204,7 @@ app.post("/webhook", async (req, res) => {
     const symbolFixed = normalizeSymbol(symbol);
 
     // =============================
-    // ZONE EXIT（強制全決済）
+    // ZONE EXIT
     // =============================
     if (alert === "ZONE_EXIT") {
 
@@ -235,9 +219,12 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
+    // =============================
+    // MARKER判定
+    // =============================
     const side =
-      alert === "LONG_LIMIT" ? "LONG" :
-      alert === "SHORT_LIMIT" ? "SHORT" : null;
+      alert === "LONG_MARKET" ? "LONG" :
+      alert === "SHORT_MARKET" ? "SHORT" : null;
 
     if (!side) return;
 
@@ -251,21 +238,19 @@ app.post("/webhook", async (req, res) => {
     const pos = await getPosition(symbolFixed);
 
     // =============================
-    // ✅ 1ポジ固定ロジック（ここが核心）
+    // 1ポジ制御
     // =============================
     if (hasPosition(pos)) {
 
-      // 同方向 → 完全スキップ
       if (
         (side === "LONG" && pos.long > 0) ||
         (side === "SHORT" && pos.short < 0)
       ) {
-        console.log("⛔ 同方向ポジあり → 新規エントリー禁止");
+        console.log("⛔ 同方向スキップ");
         return;
       }
 
-      // 逆方向 → クローズしてから
-      console.log("🔁 反転エントリー");
+      console.log("🔁 反転クローズ");
 
       const success = await closeAllSafe(symbolFixed);
       if (!success) return;
@@ -273,34 +258,30 @@ app.post("/webhook", async (req, res) => {
       await sleep(POST_CLOSE_WAIT);
     }
 
-    // pendingも一旦全部消す（重複防止）
     await cancelAll(symbolFixed);
 
-    await placeLimit(
+    // =============================
+    // ★MARKET発注
+    // =============================
+    await placeMarket(
       symbolFixed,
       units,
-      Number(entryPrice),
       Number(stopLossPrice),
       Number(takeProfitPrice)
     );
 
-    console.log("📌 LIMIT発注");
+    console.log("📌 MARKET発注");
 
     lastEntryTime = Date.now();
     lastEntrySide = side;
 
   } catch (err) {
-
     console.error("❌ ERROR:", err);
-
   } finally {
-
     processing = false;
-
   }
-
 });
 
 app.listen(PORT, () =>
-  console.log("🚀 Zone Ultra Safe Institutional v8 ONE POSITION")
+  console.log("🚀 MARKET VERSION v1 READY")
 );
