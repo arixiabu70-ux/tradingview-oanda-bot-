@@ -8,15 +8,15 @@ const PORT = process.env.PORT || 8080;
 const { OANDA_ACCOUNT_ID, OANDA_API_KEY } = process.env;
 
 const BASE = "https://api-fxtrade.oanda.com/v3/accounts";
-const FIXED_UNITS = 20000;
 
-const COOLDOWN_MS = 8000;
-const POST_CLOSE_WAIT = 3000;
+const FIXED_UNITS = 20000;
+const SL_PIPS = 20;
+const RR = 2;
+const WAIT = 2000;
+const COOLDOWN = 8000;
 
 let processing = false;
-
-let lastEntryTime = 0;
-let lastEntrySide = null;
+let lastTime = 0;
 
 const auth = {
   Authorization: `Bearer ${OANDA_API_KEY}`,
@@ -25,9 +25,6 @@ const auth = {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* =============================
-   シンボル変換
-============================= */
 function normalizeSymbol(sym) {
   if (sym === "USDJPY") return "USD_JPY";
   if (sym === "EURJPY") return "EUR_JPY";
@@ -35,21 +32,15 @@ function normalizeSymbol(sym) {
   return sym;
 }
 
-/* =============================
-   ★価格フォーマット（最重要）
-============================= */
-function formatPrice(price, symbol) {
-  const precisionMap = {
-    "USD_JPY": 3,
-    "EUR_JPY": 3,
-    "GBP_JPY": 3
-  };
+function getPip(symbol) {
+  return symbol.includes("JPY") ? 0.01 : 0.0001;
+}
 
-  const precision = precisionMap[symbol] ?? 5;
+function formatPrice(price, symbol) {
+  const precision = symbol.includes("JPY") ? 3 : 5;
   return Number(price).toFixed(precision);
 }
 
-/* ============================= */
 async function fetchJSON(url, options = {}) {
   const res = await fetch(url, options);
   const text = await res.text();
@@ -61,76 +52,22 @@ async function fetchJSON(url, options = {}) {
   catch { return {}; }
 }
 
-/* ============================= */
-async function getPosition(symbol) {
+/* =============================
+   ポジション取得
+============================= */
+async function getTrade(symbol) {
   const r = await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/openPositions`,
+    `${BASE}/${OANDA_ACCOUNT_ID}/openTrades`,
     { method: "GET", headers: auth }
   );
 
-  const pos = (r.positions ?? []).find(p => p.instrument === symbol);
-
-  if (!pos) return null;
-
-  return {
-    long: parseInt(pos.long.units),
-    short: parseInt(pos.short.units)
-  };
+  return (r.trades ?? []).find(t => t.instrument === symbol);
 }
 
-function hasPosition(pos) {
-  if (!pos) return false;
-  return pos.long !== 0 || pos.short !== 0;
-}
-
-/* ============================= */
-async function closeAllSafe(symbol) {
-
-  const pos = await getPosition(symbol);
-
-  if (!pos) {
-    console.log("ℹ ポジション無し");
-    return true;
-  }
-
-  let unitsToClose = 0;
-
-  if (pos.long > 0) unitsToClose = -pos.long;
-  if (pos.short < 0) unitsToClose = -pos.short;
-
-  if (unitsToClose === 0) return true;
-
-  const body = {
-    order: {
-      type: "MARKET",
-      instrument: symbol,
-      units: unitsToClose.toString(),
-      timeInForce: "FOK",
-      positionFill: "DEFAULT"
-    }
-  };
-
-  const r = await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
-    {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify(body)
-    }
-  );
-
-  if (r.orderFillTransaction) {
-    console.log("✅ MARKETクローズ成功");
-    return true;
-  }
-
-  console.log("❌ MARKETクローズ失敗");
-  return false;
-}
-
-/* ============================= */
+/* =============================
+   注文削除
+============================= */
 async function cancelAll(symbol) {
-
   const r = await fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/pendingOrders`,
     { method: "GET", headers: auth }
@@ -147,14 +84,41 @@ async function cancelAll(symbol) {
 }
 
 /* =============================
-   ★MARKET注文（修正版）
+   全決済
 ============================= */
-async function placeMarket(symbol, units, slPrice, tpPrice) {
+async function closeAll(symbol) {
+  const trade = await getTrade(symbol);
+  if (!trade) return;
 
-  const sl = formatPrice(slPrice, symbol);
-  const tp = formatPrice(tpPrice, symbol);
+  const units = -parseInt(trade.currentUnits);
 
-  console.log(`🎯 SL: ${sl} / TP: ${tp}`);
+  await fetchJSON(
+    `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
+    {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        order: {
+          type: "MARKET",
+          instrument: symbol,
+          units: units.toString(),
+          timeInForce: "FOK",
+          positionFill: "DEFAULT"
+        }
+      })
+    }
+  );
+
+  console.log("✅ クローズ完了");
+}
+
+/* =============================
+   エントリー（SLのみ）
+============================= */
+async function entry(symbol, side) {
+
+  const pip = getPip(symbol);
+  const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
 
   return fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
@@ -168,13 +132,8 @@ async function placeMarket(symbol, units, slPrice, tpPrice) {
           units: units.toString(),
           timeInForce: "FOK",
           positionFill: "DEFAULT",
-
-          takeProfitOnFill: {
-            price: tp
-          },
-
           stopLossOnFill: {
-            price: sl
+            distance: (pip * SL_PIPS).toString()
           }
         }
       })
@@ -182,20 +141,82 @@ async function placeMarket(symbol, units, slPrice, tpPrice) {
   );
 }
 
-/* ============================= */
-function cooldownActive(side) {
-  if (!lastEntrySide) return false;
-  if (side !== lastEntrySide) return false;
-  return Date.now() - lastEntryTime < COOLDOWN_MS;
+/* =============================
+   RR設定（直近＋最低保証）
+============================= */
+async function setRR(symbol, side, payload) {
+
+  await sleep(WAIT);
+
+  const trade = await getTrade(symbol);
+  if (!trade) {
+    console.log("❌ トレードなし");
+    return;
+  }
+
+  const entry = Number(trade.price);
+  const tradeID = trade.id;
+  const pip = getPip(symbol);
+
+  let baseRisk;
+
+  if (side === "LONG") {
+    const recentLow = Number(payload.recentLow);
+    baseRisk = entry - recentLow;
+  } else {
+    const recentHigh = Number(payload.recentHigh);
+    baseRisk = recentHigh - entry;
+  }
+
+  const minRisk = pip * SL_PIPS;
+  const risk = Math.max(baseRisk, minRisk);
+
+  let sl, tp;
+
+  if (side === "LONG") {
+    sl = entry - risk;
+    tp = entry + risk * RR;
+  } else {
+    sl = entry + risk;
+    tp = entry - risk * RR;
+  }
+
+  sl = formatPrice(sl, symbol);
+  tp = formatPrice(tp, symbol);
+
+  console.log(`🎯 SL:${sl} TP:${tp}`);
+
+  await cancelAll(symbol);
+
+  await fetchJSON(
+    `${BASE}/${OANDA_ACCOUNT_ID}/trades/${tradeID}/orders`,
+    {
+      method: "PUT",
+      headers: auth,
+      body: JSON.stringify({
+        takeProfit: { price: tp },
+        stopLoss: { price: sl }
+      })
+    }
+  );
+
+  console.log("✅ RR設定完了");
 }
 
-/* ============================= */
+/* =============================
+   Webhook
+============================= */
 app.post("/webhook", async (req, res) => {
 
-  res.json({ received: true });
+  res.json({ ok: true });
 
   if (processing) {
-    console.log("⚠ 多重Webhook防止");
+    console.log("⚠ 多重防止");
+    return;
+  }
+
+  if (Date.now() - lastTime < COOLDOWN) {
+    console.log("⏳ クールダウン");
     return;
   }
 
@@ -207,95 +228,38 @@ app.post("/webhook", async (req, res) => {
       ? JSON.parse(req.body.alert_message)
       : req.body;
 
-    console.log("📬 WEBHOOK:", payload);
+    console.log("📬", payload);
 
-    const {
-      alert,
-      symbol,
-      entryPrice,
-      stopLossPrice,
-      takeProfitPrice
-    } = payload;
-
+    const { alert, symbol } = payload;
     if (!symbol) return;
 
-    const symbolFixed = normalizeSymbol(symbol);
+    const sym = normalizeSymbol(symbol);
 
-    /* ===== ZONE EXIT ===== */
     if (alert === "ZONE_EXIT") {
-
-      console.log("🚪 ZONE_EXIT");
-
-      await cancelAll(symbolFixed);
-      await closeAllSafe(symbolFixed);
-
-      await sleep(POST_CLOSE_WAIT);
-
-      lastEntrySide = null;
+      await cancelAll(sym);
+      await closeAll(sym);
       return;
     }
 
-    /* ===== エントリー種別 ===== */
-    const side =
-      alert === "LONG_MARKET" ? "LONG" :
-      alert === "SHORT_MARKET" ? "SHORT" : null;
-
-    if (!side) return;
-
-    const units = side === "LONG" ? FIXED_UNITS : -FIXED_UNITS;
-
-    if (cooldownActive(side)) {
-      console.log("⏳ クールダウン中");
-      return;
+    if (alert === "LONG_MARKET") {
+      await entry(sym, "LONG");
+      await setRR(sym, "LONG", payload);
     }
 
-    const pos = await getPosition(symbolFixed);
-
-    /* ===== 1ポジ制御 ===== */
-    if (hasPosition(pos)) {
-
-      if (
-        (side === "LONG" && pos.long > 0) ||
-        (side === "SHORT" && pos.short < 0)
-      ) {
-        console.log("⛔ 同方向スキップ");
-        return;
-      }
-
-      console.log("🔁 反転クローズ");
-
-      const success = await closeAllSafe(symbolFixed);
-      if (!success) return;
-
-      await sleep(POST_CLOSE_WAIT);
+    if (alert === "SHORT_MARKET") {
+      await entry(sym, "SHORT");
+      await setRR(sym, "SHORT", payload);
     }
 
-    await cancelAll(symbolFixed);
+    lastTime = Date.now();
 
-    /* ===== 発注 ===== */
-    const result = await placeMarket(
-      symbolFixed,
-      units,
-      Number(stopLossPrice),
-      Number(takeProfitPrice)
-    );
-
-    if (result.orderFillTransaction) {
-      console.log("✅ エントリー成功");
-    } else {
-      console.log("❌ エントリー失敗");
-    }
-
-    lastEntryTime = Date.now();
-    lastEntrySide = side;
-
-  } catch (err) {
-    console.error("❌ ERROR:", err);
+  } catch (e) {
+    console.error("❌ ERROR", e);
   } finally {
     processing = false;
   }
 });
 
 app.listen(PORT, () =>
-  console.log("🚀 MARKET VERSION v2 READY")
+  console.log("🚀 後付けRR＋直近ベース 完成版")
 );
