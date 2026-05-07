@@ -2,25 +2,28 @@ import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
+
 app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
+const PORT =
+  process.env.PORT || 8080;
 
 const {
   OANDA_ACCOUNT_ID,
   OANDA_API_KEY
 } = process.env;
 
-const BASE = "https://api-fxtrade.oanda.com/v3/accounts";
+const BASE =
+  "https://api-fxtrade.oanda.com/v3/accounts";
 
 //==================================================
 // 設定
 //==================================================
 const FIXED_UNITS = 20000;
-const SL_PIPS = 20;
-const RR = 2;
 
-const WAIT = 2000;
+const TP_PIPS = 10;
+const SL_PIPS = 6;
+
 const COOLDOWN = 8000;
 
 let processing = false;
@@ -38,30 +41,47 @@ const sleep = (ms) =>
   new Promise(r => setTimeout(r, ms));
 
 function normalizeSymbol(sym) {
-  if (sym === "USDJPY") return "USD_JPY";
-  if (sym === "EURJPY") return "EUR_JPY";
-  if (sym === "GBPJPY") return "GBP_JPY";
+
+  if (sym === "USDJPY")
+    return "USD_JPY";
+
+  if (sym === "EURJPY")
+    return "EUR_JPY";
+
+  if (sym === "GBPJPY")
+    return "GBP_JPY";
+
   return sym;
 }
 
 function getPip(symbol) {
+
   return symbol.includes("JPY")
     ? 0.01
     : 0.0001;
 }
 
 function formatPrice(price, symbol) {
-  const precision = symbol.includes("JPY")
+
+  const precision =
+    symbol.includes("JPY")
     ? 3
     : 5;
 
-  return Number(price).toFixed(precision);
+  return Number(price)
+    .toFixed(precision);
 }
 
-async function fetchJSON(url, options = {}) {
+async function fetchJSON(
+  url,
+  options = {}
+) {
 
-  const res = await fetch(url, options);
-  const text = await res.text();
+  const res =
+    await fetch(url, options);
+
+  const text =
+    await res.text();
 
   console.log(`📡 ${options.method} ${url}`);
   console.log(`📥 [${res.status}] ${text}`);
@@ -74,7 +94,7 @@ async function fetchJSON(url, options = {}) {
 }
 
 //==================================================
-// ポジション取得
+// openTrade取得
 //==================================================
 async function getTrade(symbol) {
 
@@ -87,7 +107,9 @@ async function getTrade(symbol) {
   );
 
   return (r.trades ?? [])
-    .find(t => t.instrument === symbol);
+    .find(
+      t => t.instrument === symbol
+    );
 }
 
 //==================================================
@@ -105,19 +127,13 @@ async function cancelAll(symbol) {
 
   for (const o of r.orders ?? []) {
 
-    if (
-      o.instrument === symbol ||
-      !o.instrument
-    ) {
-
-      await fetchJSON(
-        `${BASE}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
-        {
-          method: "PUT",
-          headers: auth
-        }
-      );
-    }
+    await fetchJSON(
+      `${BASE}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
+      {
+        method: "PUT",
+        headers: auth
+      }
+    );
   }
 }
 
@@ -126,10 +142,11 @@ async function cancelAll(symbol) {
 //==================================================
 async function closeAll(symbol) {
 
-  const trade = await getTrade(symbol);
+  const trade =
+    await getTrade(symbol);
 
   if (!trade) {
-    console.log("ℹ ポジションなし");
+    console.log("ℹ ポジなし");
     return;
   }
 
@@ -161,7 +178,8 @@ async function closeAll(symbol) {
 //==================================================
 async function entry(symbol, side) {
 
-  const pip = getPip(symbol);
+  const pip =
+    getPip(symbol);
 
   const units =
     side === "LONG"
@@ -175,112 +193,30 @@ async function entry(symbol, side) {
       headers: auth,
       body: JSON.stringify({
         order: {
+
           type: "MARKET",
+
           instrument: symbol,
+
           units: units.toString(),
+
           timeInForce: "FOK",
+
           positionFill: "DEFAULT",
 
+          takeProfitOnFill: {
+            distance:
+              (pip * TP_PIPS).toString()
+          },
+
           stopLossOnFill: {
-            distance: (
-              pip * SL_PIPS
-            ).toString()
+            distance:
+              (pip * SL_PIPS).toString()
           }
         }
       })
     }
   );
-}
-
-//==================================================
-// RR設定
-//==================================================
-async function setRR(
-  symbol,
-  side,
-  payload
-) {
-
-  await sleep(WAIT);
-
-  const trade =
-    await getTrade(symbol);
-
-  if (!trade) {
-    console.log("❌ トレードなし");
-    return;
-  }
-
-  const entryPrice =
-    Number(trade.price);
-
-  const tradeID = trade.id;
-
-  const pip = getPip(symbol);
-
-  let baseRisk;
-
-  if (side === "LONG") {
-
-    const recentLow =
-      Number(payload.recentLow);
-
-    baseRisk =
-      entryPrice - recentLow;
-
-  } else {
-
-    const recentHigh =
-      Number(payload.recentHigh);
-
-    baseRisk =
-      recentHigh - entryPrice;
-  }
-
-  const minRisk =
-    pip * SL_PIPS;
-
-  const risk =
-    Math.max(baseRisk, minRisk);
-
-  let sl;
-  let tp;
-
-  if (side === "LONG") {
-
-    sl = entryPrice - risk;
-    tp = entryPrice + risk * RR;
-
-  } else {
-
-    sl = entryPrice + risk;
-    tp = entryPrice - risk * RR;
-  }
-
-  sl = formatPrice(sl, symbol);
-  tp = formatPrice(tp, symbol);
-
-  console.log(`🎯 SL:${sl} TP:${tp}`);
-
-  await cancelAll(symbol);
-
-  await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/trades/${tradeID}/orders`,
-    {
-      method: "PUT",
-      headers: auth,
-      body: JSON.stringify({
-        takeProfit: {
-          price: tp
-        },
-        stopLoss: {
-          price: sl
-        }
-      })
-    }
-  );
-
-  console.log("✅ RR設定完了");
 }
 
 //==================================================
@@ -345,7 +281,6 @@ app.post(
       //========================================
       if (alert === "LONG_MARKET") {
 
-        // 既存を必ず消す
         await cancelAll(sym);
 
         await closeAll(sym);
@@ -353,12 +288,6 @@ app.post(
         await sleep(1000);
 
         await entry(sym, "LONG");
-
-        await setRR(
-          sym,
-          "LONG",
-          payload
-        );
       }
 
       //========================================
@@ -366,7 +295,6 @@ app.post(
       //========================================
       if (alert === "SHORT_MARKET") {
 
-        // 既存を必ず消す
         await cancelAll(sym);
 
         await closeAll(sym);
@@ -374,12 +302,6 @@ app.post(
         await sleep(1000);
 
         await entry(sym, "SHORT");
-
-        await setRR(
-          sym,
-          "SHORT",
-          payload
-        );
       }
 
       lastTime = Date.now();
@@ -398,6 +320,6 @@ app.post(
 app.listen(PORT, () => {
 
   console.log(
-    "🚀 RR AutoTrade FINAL"
+    "🚀 FINAL PRO AUTO TRADE"
   );
 });
