@@ -2,86 +2,74 @@ import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
-
 app.use(express.json());
 
-const PORT =
-  process.env.PORT || 8080;
+const PORT = process.env.PORT || 8080;
 
 const {
   OANDA_ACCOUNT_ID,
   OANDA_API_KEY
 } = process.env;
 
-const BASE =
-  "https://api-fxtrade.oanda.com/v3/accounts";
+const BASE = "https://api-fxtrade.oanda.com/v3/accounts";
 
-//==================================================
-// 設定
-//==================================================
 const FIXED_UNITS = 20000;
 
-const TP_PIPS = 10;
-const SL_PIPS = 6;
-
-const COOLDOWN = 8000;
+const COOLDOWN_MS = 8000;
+const POST_CLOSE_WAIT = 3000;
 
 let processing = false;
-let lastTime = 0;
+let lastEntryTime = 0;
+let lastEntrySide = null;
 
-//==================================================
-// 共通
-//==================================================
+/* =============================
+   認証
+============================= */
+
 const auth = {
   Authorization: `Bearer ${OANDA_API_KEY}`,
   "Content-Type": "application/json"
 };
 
 const sleep = (ms) =>
-  new Promise(r => setTimeout(r, ms));
+  new Promise((r) => setTimeout(r, ms));
+
+/* =============================
+   シンボル変換
+============================= */
 
 function normalizeSymbol(sym) {
-
-  if (sym === "USDJPY")
-    return "USD_JPY";
-
-  if (sym === "EURJPY")
-    return "EUR_JPY";
-
-  if (sym === "GBPJPY")
-    return "GBP_JPY";
+  if (sym === "USDJPY") return "USD_JPY";
+  if (sym === "EURJPY") return "EUR_JPY";
+  if (sym === "GBPJPY") return "GBP_JPY";
 
   return sym;
 }
 
-function getPip(symbol) {
-
-  return symbol.includes("JPY")
-    ? 0.01
-    : 0.0001;
-}
+/* =============================
+   価格フォーマット
+============================= */
 
 function formatPrice(price, symbol) {
+  const precisionMap = {
+    USD_JPY: 3,
+    EUR_JPY: 3,
+    GBP_JPY: 3
+  };
 
-  const precision =
-    symbol.includes("JPY")
-    ? 3
-    : 5;
+  const precision = precisionMap[symbol] ?? 5;
 
-  return Number(price)
-    .toFixed(precision);
+  return Number(price).toFixed(precision);
 }
 
-async function fetchJSON(
-  url,
-  options = {}
-) {
+/* =============================
+   API通信
+============================= */
 
-  const res =
-    await fetch(url, options);
+async function fetchJSON(url, options = {}) {
+  const res = await fetch(url, options);
 
-  const text =
-    await res.text();
+  const text = await res.text();
 
   console.log(`📡 ${options.method} ${url}`);
   console.log(`📥 [${res.status}] ${text}`);
@@ -93,30 +81,91 @@ async function fetchJSON(
   }
 }
 
-//==================================================
-// openTrade取得
-//==================================================
-async function getTrade(symbol) {
+/* =============================
+   現在ポジ取得
+============================= */
 
+async function getPosition(symbol) {
   const r = await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/openTrades`,
+    `${BASE}/${OANDA_ACCOUNT_ID}/openPositions`,
     {
       method: "GET",
       headers: auth
     }
   );
 
-  return (r.trades ?? [])
-    .find(
-      t => t.instrument === symbol
-    );
+  const pos = (r.positions ?? []).find(
+    (p) => p.instrument === symbol
+  );
+
+  if (!pos) return null;
+
+  return {
+    long: parseInt(pos.long.units),
+    short: parseInt(pos.short.units)
+  };
 }
 
-//==================================================
-// pending削除
-//==================================================
-async function cancelAll(symbol) {
+function hasPosition(pos) {
+  if (!pos) return false;
 
+  return pos.long !== 0 || pos.short !== 0;
+}
+
+/* =============================
+   全決済
+============================= */
+
+async function closeAllSafe(symbol) {
+  const pos = await getPosition(symbol);
+
+  if (!pos) {
+    console.log("ℹ ポジション無し");
+    return true;
+  }
+
+  let unitsToClose = 0;
+
+  if (pos.long > 0) unitsToClose = -pos.long;
+
+  if (pos.short < 0) unitsToClose = -pos.short;
+
+  if (unitsToClose === 0) return true;
+
+  const body = {
+    order: {
+      type: "MARKET",
+      instrument: symbol,
+      units: unitsToClose.toString(),
+      timeInForce: "FOK",
+      positionFill: "DEFAULT"
+    }
+  };
+
+  const r = await fetchJSON(
+    `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
+    {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify(body)
+    }
+  );
+
+  if (r.orderFillTransaction) {
+    console.log("✅ MARKETクローズ成功");
+    return true;
+  }
+
+  console.log("❌ MARKETクローズ失敗");
+
+  return false;
+}
+
+/* =============================
+   全注文キャンセル
+============================= */
+
+async function cancelAll(symbol) {
   const r = await fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/pendingOrders`,
     {
@@ -126,92 +175,52 @@ async function cancelAll(symbol) {
   );
 
   for (const o of r.orders ?? []) {
-
-    await fetchJSON(
-      `${BASE}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
-      {
-        method: "PUT",
-        headers: auth
-      }
-    );
-  }
-}
-
-//==================================================
-// 全決済
-//==================================================
-async function closeAll(symbol) {
-
-  const trade =
-    await getTrade(symbol);
-
-  if (!trade) {
-    console.log("ℹ ポジなし");
-    return;
-  }
-
-  const units =
-    -parseInt(trade.currentUnits);
-
-  await fetchJSON(
-    `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
-    {
-      method: "POST",
-      headers: auth,
-      body: JSON.stringify({
-        order: {
-          type: "MARKET",
-          instrument: symbol,
-          units: units.toString(),
-          timeInForce: "FOK",
-          positionFill: "DEFAULT"
+    if (o.instrument === symbol) {
+      await fetchJSON(
+        `${BASE}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
+        {
+          method: "PUT",
+          headers: auth
         }
-      })
+      );
     }
-  );
-
-  console.log("✅ クローズ完了");
+  }
 }
 
-//==================================================
-// エントリー
-//==================================================
-async function entry(symbol, side) {
+/* =============================
+   MARKET注文
+============================= */
 
-  const pip =
-    getPip(symbol);
+async function placeMarket(
+  symbol,
+  units,
+  slPrice,
+  tpPrice
+) {
+  const sl = formatPrice(slPrice, symbol);
+  const tp = formatPrice(tpPrice, symbol);
 
-  const units =
-    side === "LONG"
-      ? FIXED_UNITS
-      : -FIXED_UNITS;
+  console.log(`🎯 SL: ${sl} / TP: ${tp}`);
 
-  return await fetchJSON(
+  return fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
     {
       method: "POST",
       headers: auth,
       body: JSON.stringify({
         order: {
-
           type: "MARKET",
-
           instrument: symbol,
-
           units: units.toString(),
-
           timeInForce: "FOK",
-
           positionFill: "DEFAULT",
 
           takeProfitOnFill: {
-            distance:
-              (pip * TP_PIPS).toString()
+            price: tp
           },
 
           stopLossOnFill: {
-            distance:
-              (pip * SL_PIPS).toString()
+            price: sl
           }
         }
       })
@@ -219,107 +228,148 @@ async function entry(symbol, side) {
   );
 }
 
-//==================================================
-// Webhook
-//==================================================
-app.post(
-  "/webhook",
-  async (req, res) => {
+/* =============================
+   クールダウン
+============================= */
 
-    res.json({ ok: true });
+function cooldownActive(side) {
+  if (!lastEntrySide) return false;
 
-    if (processing) {
-      console.log("⚠ 多重防止");
+  if (side !== lastEntrySide) return false;
+
+  return (
+    Date.now() - lastEntryTime <
+    COOLDOWN_MS
+  );
+}
+
+/* =============================
+   WEBHOOK
+============================= */
+
+app.post("/webhook", async (req, res) => {
+  res.json({ received: true });
+
+  if (processing) {
+    console.log("⚠ 多重Webhook防止");
+    return;
+  }
+
+  processing = true;
+
+  try {
+    const payload = req.body.alert_message
+      ? JSON.parse(req.body.alert_message)
+      : req.body;
+
+    console.log("📬 WEBHOOK:", payload);
+
+    const {
+      alert,
+      symbol,
+      stopLossPrice,
+      takeProfitPrice
+    } = payload;
+
+    if (!symbol) return;
+
+    const symbolFixed =
+      normalizeSymbol(symbol);
+
+    /* ===== ZONE EXIT ===== */
+
+    if (alert === "ZONE_EXIT") {
+      console.log("🚪 ZONE_EXIT");
+
+      await cancelAll(symbolFixed);
+
+      await closeAllSafe(symbolFixed);
+
+      await sleep(POST_CLOSE_WAIT);
+
+      lastEntrySide = null;
+
       return;
     }
 
-    if (
-      Date.now() - lastTime
-      < COOLDOWN
-    ) {
-      console.log("⏳ クールダウン");
+    /* ===== エントリー判定 ===== */
+
+    const side =
+      alert === "LONG_MARKET"
+        ? "LONG"
+        : alert === "SHORT_MARKET"
+        ? "SHORT"
+        : null;
+
+    if (!side) return;
+
+    const units =
+      side === "LONG"
+        ? FIXED_UNITS
+        : -FIXED_UNITS;
+
+    /* ===== クールダウン ===== */
+
+    if (cooldownActive(side)) {
+      console.log("⏳ クールダウン中");
       return;
     }
 
-    processing = true;
+    const pos = await getPosition(symbolFixed);
 
-    try {
+    /* ===== 1ポジ制御 ===== */
 
-      const payload =
-        req.body.alert_message
-          ? JSON.parse(
-              req.body.alert_message
-            )
-          : req.body;
-
-      console.log("📬", payload);
-
-      const {
-        alert,
-        symbol
-      } = payload;
-
-      if (!symbol) return;
-
-      const sym =
-        normalizeSymbol(symbol);
-
-      //========================================
-      // EXIT
-      //========================================
-      if (alert === "ZONE_EXIT") {
-
-        await cancelAll(sym);
-
-        await closeAll(sym);
-
+    if (hasPosition(pos)) {
+      if (
+        (side === "LONG" && pos.long > 0) ||
+        (side === "SHORT" && pos.short < 0)
+      ) {
+        console.log("⛔ 同方向スキップ");
         return;
       }
 
-      //========================================
-      // LONG
-      //========================================
-      if (alert === "LONG_MARKET") {
+      console.log("🔁 反転クローズ");
 
-        await cancelAll(sym);
+      const success =
+        await closeAllSafe(symbolFixed);
 
-        await closeAll(sym);
+      if (!success) return;
 
-        await sleep(1000);
-
-        await entry(sym, "LONG");
-      }
-
-      //========================================
-      // SHORT
-      //========================================
-      if (alert === "SHORT_MARKET") {
-
-        await cancelAll(sym);
-
-        await closeAll(sym);
-
-        await sleep(1000);
-
-        await entry(sym, "SHORT");
-      }
-
-      lastTime = Date.now();
-
-    } catch (e) {
-
-      console.error("❌ ERROR", e);
-
-    } finally {
-
-      processing = false;
+      await sleep(POST_CLOSE_WAIT);
     }
+
+    /* ===== 保留注文削除 ===== */
+
+    await cancelAll(symbolFixed);
+
+    /* ===== エントリー ===== */
+
+    const result = await placeMarket(
+      symbolFixed,
+      units,
+      Number(stopLossPrice),
+      Number(takeProfitPrice)
+    );
+
+    if (result.orderFillTransaction) {
+      console.log("✅ エントリー成功");
+    } else {
+      console.log("❌ エントリー失敗");
+    }
+
+    lastEntryTime = Date.now();
+    lastEntrySide = side;
+  } catch (err) {
+    console.error("❌ ERROR:", err);
+  } finally {
+    processing = false;
   }
-);
+});
+
+/* =============================
+   起動
+============================= */
 
 app.listen(PORT, () => {
-
-  console.log(
-    "🚀 FINAL PRO AUTO TRADE"
-  );
+  console.log("🚀 MARKET VERSION v2 READY");
 });
