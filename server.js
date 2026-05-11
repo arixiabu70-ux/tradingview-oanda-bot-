@@ -11,20 +11,19 @@ const {
   OANDA_API_KEY
 } = process.env;
 
-const BASE = "https://api-fxtrade.oanda.com/v3/accounts";
+const BASE =
+  "https://api-fxtrade.oanda.com/v3/accounts";
 
 const FIXED_UNITS = 20000;
 
 const COOLDOWN_MS = 8000;
-const POST_CLOSE_WAIT = 3000;
 
-let processing = false;
 let lastEntryTime = 0;
 let lastEntrySide = null;
 
-/* =============================
+/* =========================================
    認証
-============================= */
+========================================= */
 
 const auth = {
   Authorization: `Bearer ${OANDA_API_KEY}`,
@@ -34,44 +33,53 @@ const auth = {
 const sleep = (ms) =>
   new Promise((r) => setTimeout(r, ms));
 
-/* =============================
+/* =========================================
    シンボル変換
-============================= */
+========================================= */
 
 function normalizeSymbol(sym) {
   if (sym === "USDJPY") return "USD_JPY";
   if (sym === "EURJPY") return "EUR_JPY";
   if (sym === "GBPJPY") return "GBP_JPY";
+  if (sym === "AUDJPY") return "AUD_JPY";
 
   return sym;
 }
 
-/* =============================
-   価格フォーマット
-============================= */
+/* =========================================
+   小数桁
+========================================= */
 
 function formatPrice(price, symbol) {
   const precisionMap = {
     USD_JPY: 3,
     EUR_JPY: 3,
-    GBP_JPY: 3
+    GBP_JPY: 3,
+    AUD_JPY: 3
   };
 
-  const precision = precisionMap[symbol] ?? 5;
+  const precision =
+    precisionMap[symbol] ?? 5;
 
   return Number(price).toFixed(precision);
 }
 
-/* =============================
-   API通信
-============================= */
+/* =========================================
+   API
+========================================= */
 
-async function fetchJSON(url, options = {}) {
+async function fetchJSON(
+  url,
+  options = {}
+) {
   const res = await fetch(url, options);
 
   const text = await res.text();
 
-  console.log(`📡 ${options.method} ${url}`);
+  console.log(
+    `📡 ${options.method || "GET"} ${url}`
+  );
+
   console.log(`📥 [${res.status}] ${text}`);
 
   try {
@@ -81,9 +89,9 @@ async function fetchJSON(url, options = {}) {
   }
 }
 
-/* =============================
-   現在ポジ取得
-============================= */
+/* =========================================
+   ポジション取得
+========================================= */
 
 async function getPosition(symbol) {
   const r = await fetchJSON(
@@ -112,9 +120,9 @@ function hasPosition(pos) {
   return pos.long !== 0 || pos.short !== 0;
 }
 
-/* =============================
+/* =========================================
    全決済
-============================= */
+========================================= */
 
 async function closeAllSafe(symbol) {
   const pos = await getPosition(symbol);
@@ -126,11 +134,18 @@ async function closeAllSafe(symbol) {
 
   let unitsToClose = 0;
 
-  if (pos.long > 0) unitsToClose = -pos.long;
+  if (pos.long > 0)
+    unitsToClose = -pos.long;
 
-  if (pos.short < 0) unitsToClose = -pos.short;
+  if (pos.short < 0)
+    unitsToClose = -pos.short;
 
-  if (unitsToClose === 0) return true;
+  if (unitsToClose === 0)
+    return true;
+
+  console.log(
+    `🚪 クローズ units=${unitsToClose}`
+  );
 
   const body = {
     order: {
@@ -152,18 +167,18 @@ async function closeAllSafe(symbol) {
   );
 
   if (r.orderFillTransaction) {
-    console.log("✅ MARKETクローズ成功");
+    console.log("✅ クローズ成功");
     return true;
   }
 
-  console.log("❌ MARKETクローズ失敗");
+  console.log("❌ クローズ失敗");
 
   return false;
 }
 
-/* =============================
-   全注文キャンセル
-============================= */
+/* =========================================
+   Pending削除
+========================================= */
 
 async function cancelAll(symbol) {
   const r = await fetchJSON(
@@ -176,6 +191,10 @@ async function cancelAll(symbol) {
 
   for (const o of r.orders ?? []) {
     if (o.instrument === symbol) {
+      console.log(
+        `🗑 Pending Cancel ${o.id}`
+      );
+
       await fetchJSON(
         `${BASE}/${OANDA_ACCOUNT_ID}/orders/${o.id}/cancel`,
         {
@@ -187,9 +206,9 @@ async function cancelAll(symbol) {
   }
 }
 
-/* =============================
+/* =========================================
    MARKET注文
-============================= */
+========================================= */
 
 async function placeMarket(
   symbol,
@@ -197,10 +216,15 @@ async function placeMarket(
   slPrice,
   tpPrice
 ) {
-  const sl = formatPrice(slPrice, symbol);
-  const tp = formatPrice(tpPrice, symbol);
+  const sl =
+    formatPrice(slPrice, symbol);
 
-  console.log(`🎯 SL: ${sl} / TP: ${tp}`);
+  const tp =
+    formatPrice(tpPrice, symbol);
+
+  console.log(
+    `🎯 SL=${sl} TP=${tp}`
+  );
 
   return fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/orders`,
@@ -228,14 +252,16 @@ async function placeMarket(
   );
 }
 
-/* =============================
+/* =========================================
    クールダウン
-============================= */
+========================================= */
 
 function cooldownActive(side) {
-  if (!lastEntrySide) return false;
+  if (!lastEntrySide)
+    return false;
 
-  if (side !== lastEntrySide) return false;
+  if (side !== lastEntrySide)
+    return false;
 
   return (
     Date.now() - lastEntryTime <
@@ -243,133 +269,176 @@ function cooldownActive(side) {
   );
 }
 
-/* =============================
+/* =========================================
    WEBHOOK
-============================= */
+========================================= */
 
-app.post("/webhook", async (req, res) => {
-  res.json({ received: true });
+app.post(
+  "/webhook",
+  async (req, res) => {
+    res.json({ received: true });
 
-  if (processing) {
-    console.log("⚠ 多重Webhook防止");
-    return;
-  }
+    try {
+      const payload =
+        req.body.alert_message
+          ? JSON.parse(
+              req.body.alert_message
+            )
+          : req.body;
 
-  processing = true;
+      console.log(
+        "📬 WEBHOOK:",
+        payload
+      );
 
-  try {
-    const payload = req.body.alert_message
-      ? JSON.parse(req.body.alert_message)
-      : req.body;
+      const {
+        alert,
+        symbol,
+        stopLossPrice,
+        takeProfitPrice
+      } = payload;
 
-    console.log("📬 WEBHOOK:", payload);
-
-    const {
-      alert,
-      symbol,
-      stopLossPrice,
-      takeProfitPrice
-    } = payload;
-
-    if (!symbol) return;
-
-    const symbolFixed =
-      normalizeSymbol(symbol);
-
-    /* ===== ZONE EXIT ===== */
-
-    if (alert === "ZONE_EXIT") {
-      console.log("🚪 ZONE_EXIT");
-
-      await cancelAll(symbolFixed);
-
-      await closeAllSafe(symbolFixed);
-
-      await sleep(POST_CLOSE_WAIT);
-
-      lastEntrySide = null;
-
-      return;
-    }
-
-    /* ===== エントリー判定 ===== */
-
-    const side =
-      alert === "LONG_MARKET"
-        ? "LONG"
-        : alert === "SHORT_MARKET"
-        ? "SHORT"
-        : null;
-
-    if (!side) return;
-
-    const units =
-      side === "LONG"
-        ? FIXED_UNITS
-        : -FIXED_UNITS;
-
-    /* ===== クールダウン ===== */
-
-    if (cooldownActive(side)) {
-      console.log("⏳ クールダウン中");
-      return;
-    }
-
-    const pos = await getPosition(symbolFixed);
-
-    /* ===== 1ポジ制御 ===== */
-
-    if (hasPosition(pos)) {
-      if (
-        (side === "LONG" && pos.long > 0) ||
-        (side === "SHORT" && pos.short < 0)
-      ) {
-        console.log("⛔ 同方向スキップ");
+      if (!symbol) {
+        console.log("❌ symbol無し");
         return;
       }
 
-      console.log("🔁 反転クローズ");
+      const symbolFixed =
+        normalizeSymbol(symbol);
 
-      const success =
-        await closeAllSafe(symbolFixed);
+      /* =========================
+         エントリー方向
+      ========================= */
 
-      if (!success) return;
+      const side =
+        alert === "LONG_MARKET"
+          ? "LONG"
+          : alert === "SHORT_MARKET"
+          ? "SHORT"
+          : null;
 
-      await sleep(POST_CLOSE_WAIT);
+      if (!side) {
+        console.log(
+          "⚠ 不明アラート"
+        );
+        return;
+      }
+
+      /* =========================
+         クールダウン
+      ========================= */
+
+      if (cooldownActive(side)) {
+        console.log(
+          "⏳ クールダウン中"
+        );
+        return;
+      }
+
+      const units =
+        side === "LONG"
+          ? FIXED_UNITS
+          : -FIXED_UNITS;
+
+      /* =========================
+         現在ポジ
+      ========================= */
+
+      const pos =
+        await getPosition(
+          symbolFixed
+        );
+
+      /* =========================
+         同方向スキップ
+      ========================= */
+
+      if (hasPosition(pos)) {
+        if (
+          side === "LONG" &&
+          pos.long > 0
+        ) {
+          console.log(
+            "⛔ LONG保有中"
+          );
+          return;
+        }
+
+        if (
+          side === "SHORT" &&
+          pos.short < 0
+        ) {
+          console.log(
+            "⛔ SHORT保有中"
+          );
+          return;
+        }
+
+        /* =========================
+           反転
+        ========================= */
+
+        console.log(
+          "🔁 反転クローズ"
+        );
+
+        const closed =
+          await closeAllSafe(
+            symbolFixed
+          );
+
+        if (!closed) return;
+
+        await sleep(1000);
+      }
+
+      /* =========================
+         Pending削除
+      ========================= */
+
+      await cancelAll(symbolFixed);
+
+      /* =========================
+         エントリー
+      ========================= */
+
+      const result =
+        await placeMarket(
+          symbolFixed,
+          units,
+          Number(stopLossPrice),
+          Number(takeProfitPrice)
+        );
+
+      if (
+        result.orderFillTransaction
+      ) {
+        console.log(
+          "✅ エントリー成功"
+        );
+
+        lastEntryTime = Date.now();
+        lastEntrySide = side;
+      } else {
+        console.log(
+          "❌ エントリー失敗"
+        );
+      }
+    } catch (err) {
+      console.error(
+        "❌ ERROR:",
+        err
+      );
     }
-
-    /* ===== 保留注文削除 ===== */
-
-    await cancelAll(symbolFixed);
-
-    /* ===== エントリー ===== */
-
-    const result = await placeMarket(
-      symbolFixed,
-      units,
-      Number(stopLossPrice),
-      Number(takeProfitPrice)
-    );
-
-    if (result.orderFillTransaction) {
-      console.log("✅ エントリー成功");
-    } else {
-      console.log("❌ エントリー失敗");
-    }
-
-    lastEntryTime = Date.now();
-    lastEntrySide = side;
-  } catch (err) {
-    console.error("❌ ERROR:", err);
-  } finally {
-    processing = false;
   }
-});
+);
 
-/* =============================
+/* =========================================
    起動
-============================= */
+========================================= */
 
 app.listen(PORT, () => {
-  console.log("🚀 MARKET VERSION v2 READY");
+  console.log(
+    "🚀 MARKET VERSION v3 READY"
+  );
 });
