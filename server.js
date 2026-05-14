@@ -2,6 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
+
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
@@ -19,6 +20,7 @@ const FIXED_UNITS = 20000;
 const COOLDOWN_MS = 8000;
 
 let lastEntryTime = 0;
+
 let lastEntrySide = null;
 
 /* =========================================
@@ -38,10 +40,18 @@ const sleep = (ms) =>
 ========================================= */
 
 function normalizeSymbol(sym) {
-  if (sym === "USDJPY") return "USD_JPY";
-  if (sym === "EURJPY") return "EUR_JPY";
-  if (sym === "GBPJPY") return "GBP_JPY";
-  if (sym === "AUDJPY") return "AUD_JPY";
+
+  if (sym === "USDJPY")
+    return "USD_JPY";
+
+  if (sym === "EURJPY")
+    return "EUR_JPY";
+
+  if (sym === "GBPJPY")
+    return "GBP_JPY";
+
+  if (sym === "AUDJPY")
+    return "AUD_JPY";
 
   return sym;
 }
@@ -51,6 +61,7 @@ function normalizeSymbol(sym) {
 ========================================= */
 
 function formatPrice(price, symbol) {
+
   const precisionMap = {
     USD_JPY: 3,
     EUR_JPY: 3,
@@ -72,6 +83,7 @@ async function fetchJSON(
   url,
   options = {}
 ) {
+
   const res = await fetch(url, options);
 
   const text = await res.text();
@@ -80,11 +92,16 @@ async function fetchJSON(
     `📡 ${options.method || "GET"} ${url}`
   );
 
-  console.log(`📥 [${res.status}] ${text}`);
+  console.log(
+    `📥 [${res.status}] ${text}`
+  );
 
   try {
+
     return JSON.parse(text);
+
   } catch {
+
     return {};
   }
 }
@@ -94,6 +111,7 @@ async function fetchJSON(
 ========================================= */
 
 async function getPosition(symbol) {
+
   const r = await fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/openPositions`,
     {
@@ -102,11 +120,14 @@ async function getPosition(symbol) {
     }
   );
 
-  const pos = (r.positions ?? []).find(
-    (p) => p.instrument === symbol
-  );
+  const pos =
+    (r.positions ?? []).find(
+      (p) =>
+        p.instrument === symbol
+    );
 
-  if (!pos) return null;
+  if (!pos)
+    return null;
 
   return {
     long: parseInt(pos.long.units),
@@ -115,9 +136,14 @@ async function getPosition(symbol) {
 }
 
 function hasPosition(pos) {
-  if (!pos) return false;
 
-  return pos.long !== 0 || pos.short !== 0;
+  if (!pos)
+    return false;
+
+  return (
+    pos.long !== 0 ||
+    pos.short !== 0
+  );
 }
 
 /* =========================================
@@ -125,10 +151,16 @@ function hasPosition(pos) {
 ========================================= */
 
 async function closeAllSafe(symbol) {
-  const pos = await getPosition(symbol);
+
+  const pos =
+    await getPosition(symbol);
 
   if (!pos) {
-    console.log("ℹ ポジション無し");
+
+    console.log(
+      "ℹ ポジション無し"
+    );
+
     return true;
   }
 
@@ -167,11 +199,17 @@ async function closeAllSafe(symbol) {
   );
 
   if (r.orderFillTransaction) {
-    console.log("✅ クローズ成功");
+
+    console.log(
+      "✅ クローズ成功"
+    );
+
     return true;
   }
 
-  console.log("❌ クローズ失敗");
+  console.log(
+    "❌ クローズ失敗"
+  );
 
   return false;
 }
@@ -181,6 +219,7 @@ async function closeAllSafe(symbol) {
 ========================================= */
 
 async function cancelAll(symbol) {
+
   const r = await fetchJSON(
     `${BASE}/${OANDA_ACCOUNT_ID}/pendingOrders`,
     {
@@ -190,7 +229,9 @@ async function cancelAll(symbol) {
   );
 
   for (const o of r.orders ?? []) {
+
     if (o.instrument === symbol) {
+
       console.log(
         `🗑 Pending Cancel ${o.id}`
       );
@@ -216,6 +257,7 @@ async function placeMarket(
   slPrice,
   tpPrice
 ) {
+
   const sl =
     formatPrice(slPrice, symbol);
 
@@ -257,6 +299,7 @@ async function placeMarket(
 ========================================= */
 
 function cooldownActive(side) {
+
   if (!lastEntrySide)
     return false;
 
@@ -276,9 +319,13 @@ function cooldownActive(side) {
 app.post(
   "/webhook",
   async (req, res) => {
-    res.json({ received: true });
+
+    res.json({
+      received: true
+    });
 
     try {
+
       const payload =
         req.body.alert_message
           ? JSON.parse(
@@ -299,12 +346,46 @@ app.post(
       } = payload;
 
       if (!symbol) {
-        console.log("❌ symbol無し");
+
+        console.log(
+          "❌ symbol無し"
+        );
+
         return;
       }
 
       const symbolFixed =
         normalizeSymbol(symbol);
+
+      /* =========================
+         CLOSE処理
+      ========================= */
+
+      if (alert === "CLOSE_LONG") {
+
+        console.log(
+          "🚪 CLOSE LONG"
+        );
+
+        await closeAllSafe(
+          symbolFixed
+        );
+
+        return;
+      }
+
+      if (alert === "CLOSE_SHORT") {
+
+        console.log(
+          "🚪 CLOSE SHORT"
+        );
+
+        await closeAllSafe(
+          symbolFixed
+        );
+
+        return;
+      }
 
       /* =========================
          エントリー方向
@@ -318,9 +399,11 @@ app.post(
           : null;
 
       if (!side) {
+
         console.log(
           "⚠ 不明アラート"
         );
+
         return;
       }
 
@@ -328,10 +411,14 @@ app.post(
          クールダウン
       ========================= */
 
-      if (cooldownActive(side)) {
+      if (
+        cooldownActive(side)
+      ) {
+
         console.log(
           "⏳ クールダウン中"
         );
+
         return;
       }
 
@@ -354,13 +441,16 @@ app.post(
       ========================= */
 
       if (hasPosition(pos)) {
+
         if (
           side === "LONG" &&
           pos.long > 0
         ) {
+
           console.log(
             "⛔ LONG保有中"
           );
+
           return;
         }
 
@@ -368,9 +458,11 @@ app.post(
           side === "SHORT" &&
           pos.short < 0
         ) {
+
           console.log(
             "⛔ SHORT保有中"
           );
+
           return;
         }
 
@@ -387,7 +479,8 @@ app.post(
             symbolFixed
           );
 
-        if (!closed) return;
+        if (!closed)
+          return;
 
         await sleep(1000);
       }
@@ -396,7 +489,9 @@ app.post(
          Pending削除
       ========================= */
 
-      await cancelAll(symbolFixed);
+      await cancelAll(
+        symbolFixed
+      );
 
       /* =========================
          エントリー
@@ -413,18 +508,26 @@ app.post(
       if (
         result.orderFillTransaction
       ) {
+
         console.log(
           "✅ エントリー成功"
         );
 
-        lastEntryTime = Date.now();
-        lastEntrySide = side;
+        lastEntryTime =
+          Date.now();
+
+        lastEntrySide =
+          side;
+
       } else {
+
         console.log(
           "❌ エントリー失敗"
         );
       }
+
     } catch (err) {
+
       console.error(
         "❌ ERROR:",
         err
@@ -438,6 +541,7 @@ app.post(
 ========================================= */
 
 app.listen(PORT, () => {
+
   console.log(
     "🚀 MARKET VERSION v3 READY"
   );
