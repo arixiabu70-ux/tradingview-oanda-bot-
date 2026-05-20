@@ -15,7 +15,7 @@ const {
 const BASE =
   "https://api-fxtrade.oanda.com/v3/accounts";
 
-const FIXED_UNITS = 20000;
+const FIXED_UNITS = 30000;
 
 const COOLDOWN_MS = 8000;
 
